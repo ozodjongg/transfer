@@ -1,0 +1,13 @@
+{
+  "server": "localhost:8080",
+  "download_dir": "downloads",
+  "tls": {
+    "enabled": false,
+    "insecure_skip_verify": false,
+    "server_name": ""
+  },
+  "timeouts": {
+    "connect": "10s",
+    "io": "2h"
+  }
+}
