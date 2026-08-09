@@ -47,7 +47,7 @@ Default config:
 }
 ```
 
-For Railway, replace `server` with the public TCP Proxy endpoint, for example:
+If you dont have server, use our server, replace `server` with the public TCP Proxy endpoint, for example:
 
 ```json
 "server": "turntable.proxy.rlwy.net:18473"
