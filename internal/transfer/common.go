@@ -1,21 +1,17 @@
 package transfer
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-const transferBufferSize = 1024 * 1024 // 1 MiB
+const transferBufferSize = 1024 * 1024 // 1 MiB network/control buffer
 
 var transferBufferPool = sync.Pool{
 	New: func() any {
@@ -27,31 +23,6 @@ var transferBufferPool = sync.Pool{
 func getTransferBuffer() (*[]byte, func()) {
 	p := transferBufferPool.Get().(*[]byte)
 	return p, func() { transferBufferPool.Put(p) }
-}
-
-func FileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	buf, put := getTransferBuffer()
-	defer put()
-	if _, err := io.CopyBuffer(h, f, *buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func SafeFilename(name string) string {
-	name = filepath.Base(strings.TrimSpace(name))
-	name = strings.ReplaceAll(name, "\x00", "")
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "received_file"
-	}
-	return name
 }
 
 type ProgressWriter struct {
@@ -70,53 +41,54 @@ type ProgressWriter struct {
 func NewProgressWriter(label string, total, baseOffset int64) *ProgressWriter {
 	now := time.Now()
 	return &ProgressWriter{
-		Total:      total,
-		Done:       baseOffset,
-		BaseOffset: baseOffset,
-		Label:      label,
-		startedAt:  now,
-		lastPrint:  now,
-		lastDone:   baseOffset,
+		Total: total, Done: baseOffset, BaseOffset: baseOffset, Label: label,
+		startedAt: now, lastPrint: now, lastDone: baseOffset,
 	}
 }
 
 func (p *ProgressWriter) Write(b []byte) (int, error) {
-	n := len(b)
-	p.Done += int64(n)
+	p.Add(int64(len(b)))
+	return len(b), nil
+}
+
+func (p *ProgressWriter) Add(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.Done += n
+	if p.Done > p.Total {
+		p.Done = p.Total
+	}
 	now := time.Now()
 	if now.Sub(p.lastPrint) >= 500*time.Millisecond || p.Done >= p.Total {
 		p.print(now)
 	}
-	return n, nil
 }
 
 func (p *ProgressWriter) print(now time.Time) {
-	elapsedSample := now.Sub(p.lastPrint).Seconds()
-	if elapsedSample > 0 {
-		instant := float64(p.Done-p.lastDone) / elapsedSample
+	sampleSeconds := now.Sub(p.lastPrint).Seconds()
+	if sampleSeconds > 0 {
+		instant := float64(p.Done-p.lastDone) / sampleSeconds
 		if p.emaBytesPS == 0 {
 			p.emaBytesPS = instant
 		} else {
-			p.emaBytesPS = p.emaBytesPS*0.70 + instant*0.30
+			p.emaBytesPS = p.emaBytesPS*0.72 + instant*0.28
 		}
 	}
 
-	pct := 0.0
+	pct := 100.0
 	if p.Total > 0 {
 		pct = float64(p.Done) * 100 / float64(p.Total)
 	}
-
 	eta := "--:--"
 	if p.emaBytesPS > 1 && p.Done < p.Total {
-		remaining := float64(p.Total-p.Done) / p.emaBytesPS
-		eta = HumanDuration(time.Duration(remaining * float64(time.Second)))
+		eta = HumanDuration(time.Duration(float64(p.Total-p.Done)/p.emaBytesPS) * time.Second)
 	} else if p.Done >= p.Total {
 		eta = "00:00"
 	}
 
-	fmt.Printf("\r%-13s %6.2f%% | %s / %s | %s/s | ETA %s",
+	fmt.Printf("\r%-14s %6.2f%% | %s / %s | %s/s | ETA %s",
 		p.Label+":", pct, HumanBytes(p.Done), HumanBytes(p.Total), HumanBytes(int64(p.emaBytesPS)), eta)
-
 	p.lastPrint = now
 	p.lastDone = p.Done
 	p.printed = true
@@ -187,7 +159,7 @@ func networkErrorSummary(err error) string {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return "TCP oqimi transfer tugashidan oldin yopildi"
 	}
-	return err.Error()
+	return strings.TrimSpace(err.Error())
 }
 
 func isRetryableNetworkError(err error) bool {
@@ -201,6 +173,21 @@ func isRetryableNetworkError(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
-	// Windows/Linux reset/abort errors are usually wrapped by net.OpError.
 	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE)
+}
+
+func writeAll(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if n > 0 {
+			b = b[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

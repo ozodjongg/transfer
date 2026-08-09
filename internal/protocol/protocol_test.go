@@ -10,10 +10,11 @@ func TestMessageRoundTrip(t *testing.T) {
 		Type:   TypePeerReady,
 		Room:   "ROOM123",
 		Offset: 1024,
-		File: &FileMeta{
-			Name:   "a.xlsx",
-			Size:   42,
-			SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Session: &SessionMeta{
+			TransferID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			PlainSize:         42,
+			PayloadSize:       58,
+			EncryptedManifest: []byte("ciphertext-only"),
 		},
 	}
 	var buf bytes.Buffer
@@ -24,7 +25,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Type != want.Type || got.Room != want.Room || got.Offset != want.Offset || got.File == nil || got.File.Name != want.File.Name || got.File.Size != want.File.Size {
+	if got.Type != want.Type || got.Room != want.Room || got.Offset != want.Offset || got.Session == nil || got.Session.TransferID != want.Session.TransferID || !bytes.Equal(got.Session.EncryptedManifest, want.Session.EncryptedManifest) {
 		t.Fatalf("unexpected round trip: %#v", got)
 	}
 }

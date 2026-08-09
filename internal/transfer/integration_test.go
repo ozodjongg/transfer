@@ -15,106 +15,119 @@ import (
 	"example.com/pro-transfer/internal/protocol"
 )
 
-func TestTransferResumesAfterForcedSenderDisconnect(t *testing.T) {
+func TestV5MultiFileFolderEncryptedTransferWithResume(t *testing.T) {
 	serverAddr := freeTCPAddr(t)
 	server := NewServer(ServerConfig{
-		Addr:                   serverAddr,
-		RoomTTL:                10 * time.Second,
-		TransferTimeout:        30 * time.Second,
-		ResumeGrace:            10 * time.Second,
-		MaxFileSize:            64 << 20,
-		MaxConnections:         32,
-		MaxHandshakesPerMinute: 1000,
-		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Addr: serverAddr, RoomTTL: 10 * time.Second, TransferTimeout: 30 * time.Second,
+		ResumeGrace: 10 * time.Second, MaxTransferSize: 64 << 20, MaxEncryptedManifest: 2 << 20,
+		MaxConnections: 32, MaxHandshakesPerMinute: 1000,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.ListenAndServe() }()
 	defer server.Shutdown()
 	waitForTCP(t, serverAddr)
 
-	proxy := newDropOnceProxy(t, serverAddr, 1<<20)
+	// Drop the first sender stream after > one encrypted chunk so receiver has
+	// an authenticated chunk boundary to resume from.
+	proxy := newDropOnceProxy(t, serverAddr, 900*1024)
 	defer proxy.Close()
 
-	sendDir := t.TempDir()
-	recvDir := t.TempDir()
-	source := filepath.Join(sendDir, "resume.bin")
-	payload := bytes.Repeat([]byte("pro-transfer-v4-resume-test\n"), 320000) // ~8 MiB
-	if err := os.WriteFile(source, payload, 0o600); err != nil {
+	srcBase := t.TempDir()
+	f1 := filepath.Join(srcBase, "report.txt")
+	data1 := bytes.Repeat([]byte("report-data-"), 90000) // > 1 MiB
+	if err := os.WriteFile(f1, data1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	folder := filepath.Join(srcBase, "Project")
+	if err := os.MkdirAll(filepath.Join(folder, "sub", "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data2 := bytes.Repeat([]byte("nested-data-"), 70000)
+	if err := os.WriteFile(filepath.Join(folder, "sub", "nested.bin"), data2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "zero.txt"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	roomCh := make(chan string, 1)
-	sendCfg := ClientConfig{
-		Addr:           proxy.Addr(),
-		ConnectTimeout: 2 * time.Second,
-		IOTimeout:      30 * time.Second,
-		OnRoomCreated: func(room string) {
-			select {
-			case roomCh <- room:
-			default:
-			}
-		},
-	}
+	recvDir := t.TempDir()
+	codeCh := make(chan string, 1)
+	sendCfg := ClientConfig{Addr: proxy.Addr(), ConnectTimeout: 2 * time.Second, IOTimeout: 30 * time.Second, OnTransferCode: func(code string) {
+		select {
+		case codeCh <- code:
+		default:
+		}
+	}}
 	recvCfg := ClientConfig{Addr: proxy.Addr(), ConnectTimeout: 2 * time.Second, IOTimeout: 30 * time.Second}
 
 	type result struct {
-		path string
-		err  error
+		paths []string
+		err   error
 	}
-	sendResult := make(chan result, 1)
-	go func() {
-		_, err := SendFile(sendCfg, source)
-		sendResult <- result{err: err}
-	}()
+	sendResult := make(chan error, 1)
+	go func() { _, err := SendPaths(sendCfg, []string{f1, folder}); sendResult <- err }()
 
-	var room string
+	var code string
 	select {
-	case room = <-roomCh:
+	case code = <-codeCh:
 	case <-time.After(5 * time.Second):
-		t.Fatal("sender did not create a room")
+		t.Fatal("sender did not create transfer code")
 	}
 
 	recvResult := make(chan result, 1)
-	go func() {
-		path, err := ReceiveFile(recvCfg, room, recvDir)
-		recvResult <- result{path: path, err: err}
-	}()
+	go func() { p, err := ReceiveTransfer(recvCfg, code, recvDir); recvResult <- result{p, err} }()
 
 	select {
-	case r := <-sendResult:
-		if r.err != nil {
-			t.Fatalf("sender failed: %v", r.err)
+	case err := <-sendResult:
+		if err != nil {
+			t.Fatalf("sender: %v", err)
 		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("sender timed out")
+	case <-time.After(20 * time.Second):
+		t.Fatal("sender timeout")
 	}
-
-	var received string
+	var paths []string
 	select {
 	case r := <-recvResult:
 		if r.err != nil {
-			t.Fatalf("receiver failed: %v", r.err)
+			t.Fatalf("receiver: %v", r.err)
 		}
-		received = r.path
-	case <-time.After(15 * time.Second):
-		t.Fatal("receiver timed out")
+		paths = r.paths
+	case <-time.After(20 * time.Second):
+		t.Fatal("receiver timeout")
+	}
+	if len(paths) != 2 {
+		t.Fatalf("final roots=%v", paths)
 	}
 
-	got, err := os.ReadFile(received)
+	got1, err := os.ReadFile(filepath.Join(recvDir, "report.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, payload) {
-		t.Fatal("received file differs from source after resume")
+	if !bytes.Equal(got1, data1) {
+		t.Fatal("report mismatch")
+	}
+	got2, err := os.ReadFile(filepath.Join(recvDir, "Project", "sub", "nested.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got2, data2) {
+		t.Fatal("nested mismatch")
+	}
+	if st, err := os.Stat(filepath.Join(recvDir, "Project", "sub", "empty")); err != nil || !st.IsDir() {
+		t.Fatal("empty directory missing")
+	}
+	if st, err := os.Stat(filepath.Join(recvDir, "Project", "zero.txt")); err != nil || st.Size() != 0 {
+		t.Fatal("zero file missing")
 	}
 	if !proxy.dropped.Load() {
-		t.Fatal("test proxy did not force the sender disconnect")
+		t.Fatal("proxy did not force disconnect")
 	}
 
 	select {
 	case err := <-serverErr:
 		if err != nil {
-			t.Fatalf("server stopped unexpectedly: %v", err)
+			t.Fatalf("server stopped: %v", err)
 		}
 	default:
 	}
@@ -126,23 +139,22 @@ func freeTCPAddr(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
+	a := ln.Addr().String()
 	_ = ln.Close()
-	return addr
+	return a
 }
-
 func waitForTCP(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
+		c, e := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if e == nil {
+			_ = c.Close()
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("server %s did not become ready", addr)
+	t.Fatalf("server not ready: %s", addr)
 }
 
 type dropOnceProxy struct {
@@ -150,7 +162,6 @@ type dropOnceProxy struct {
 	target    string
 	dropAfter int64
 	dropped   atomic.Bool
-	closed    chan struct{}
 	wg        sync.WaitGroup
 }
 
@@ -160,40 +171,24 @@ func newDropOnceProxy(t *testing.T, target string, dropAfter int64) *dropOncePro
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &dropOnceProxy{ln: ln, target: target, dropAfter: dropAfter, closed: make(chan struct{})}
+	p := &dropOnceProxy{ln: ln, target: target, dropAfter: dropAfter}
 	p.wg.Add(1)
 	go p.acceptLoop()
 	return p
 }
-
 func (p *dropOnceProxy) Addr() string { return p.ln.Addr().String() }
-
-func (p *dropOnceProxy) Close() {
-	select {
-	case <-p.closed:
-		return
-	default:
-		close(p.closed)
-		_ = p.ln.Close()
-		p.wg.Wait()
-	}
-}
-
+func (p *dropOnceProxy) Close()       { _ = p.ln.Close(); p.wg.Wait() }
 func (p *dropOnceProxy) acceptLoop() {
 	defer p.wg.Done()
 	for {
-		client, err := p.ln.Accept()
+		c, err := p.ln.Accept()
 		if err != nil {
 			return
 		}
 		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
-			p.handle(client)
-		}()
+		go func() { defer p.wg.Done(); p.handle(c) }()
 	}
 }
-
 func (p *dropOnceProxy) handle(client net.Conn) {
 	upstream, err := net.Dial("tcp", p.target)
 	if err != nil {
@@ -202,7 +197,6 @@ func (p *dropOnceProxy) handle(client net.Conn) {
 	}
 	defer client.Close()
 	defer upstream.Close()
-
 	first, err := protocol.ReadMessage(client)
 	if err != nil {
 		return
@@ -210,23 +204,11 @@ func (p *dropOnceProxy) handle(client net.Conn) {
 	if err := protocol.WriteMessage(upstream, first); err != nil {
 		return
 	}
-
 	dropThis := first.Type == protocol.TypeCreate && p.dropped.CompareAndSwap(false, true)
 	var once sync.Once
 	done := make(chan struct{})
-	closeBoth := func() {
-		once.Do(func() {
-			_ = client.Close()
-			_ = upstream.Close()
-			close(done)
-		})
-	}
-
-	go func() {
-		_, _ = io.Copy(client, upstream)
-		closeBoth()
-	}()
-
+	closeBoth := func() { once.Do(func() { _ = client.Close(); _ = upstream.Close(); close(done) }) }
+	go func() { _, _ = io.Copy(client, upstream); closeBoth() }()
 	if dropThis {
 		_, _ = io.CopyN(upstream, client, p.dropAfter)
 		closeBoth()

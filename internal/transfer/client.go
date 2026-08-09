@@ -1,6 +1,8 @@
 package transfer
 
 import (
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -26,9 +28,8 @@ type ClientConfig struct {
 	ConnectTimeout time.Duration
 	IOTimeout      time.Duration
 
-	// OnRoomCreated is optional and mainly useful for embedding/testing the
-	// transfer package. The CLI does not need to set it.
-	OnRoomCreated func(string)
+	OnRoomCreated  func(string)
+	OnTransferCode func(string)
 }
 
 func (c ClientConfig) dial() (net.Conn, error) {
@@ -38,11 +39,7 @@ func (c ClientConfig) dial() (net.Conn, error) {
 	if c.IOTimeout <= 0 {
 		c.IOTimeout = 2 * time.Hour
 	}
-
-	d := net.Dialer{
-		Timeout:   c.ConnectTimeout,
-		KeepAlive: 20 * time.Second,
-	}
+	d := net.Dialer{Timeout: c.ConnectTimeout, KeepAlive: 20 * time.Second}
 	raw, err := d.Dial("tcp", c.Addr)
 	if err != nil {
 		return nil, err
@@ -54,11 +51,9 @@ func (c ClientConfig) dial() (net.Conn, error) {
 		_ = tcp.SetReadBuffer(transferBufferSize)
 		_ = tcp.SetWriteBuffer(transferBufferSize)
 	}
-
 	if c.TLSConfig == nil {
 		return raw, nil
 	}
-
 	tlsConn := tls.Client(raw, c.TLSConfig.Clone())
 	_ = tlsConn.SetDeadline(time.Now().Add(c.ConnectTimeout))
 	if err := tlsConn.Handshake(); err != nil {
@@ -69,29 +64,44 @@ func (c ClientConfig) dial() (net.Conn, error) {
 	return tlsConn, nil
 }
 
-func SendFile(cfg ClientConfig, path string) (string, error) {
-	info, err := os.Stat(path)
+func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
+	manifest, sources, err := buildManifest(inputs)
 	if err != nil {
 		return "", err
 	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("selected path is not a regular file")
-	}
+	fileCount, dirCount := manifestCounts(manifest)
+	fmt.Printf("[i] %d ta fayl, %d ta folder | Jami: %s\n", fileCount, dirCount, HumanBytes(manifest.TotalSize))
 
-	fmt.Println("[i] SHA-256 hisoblanmoqda...")
-	sum, err := FileSHA256(path)
+	manifestJSON, err := marshalManifest(manifest)
 	if err != nil {
 		return "", err
 	}
-	meta := protocol.FileMeta{Name: filepath.Base(path), Size: info.Size(), SHA256: sum}
-
-	f, err := os.Open(path)
+	secret, err := generateTransferSecret()
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	encryptedManifest, err := encryptManifest(secret, manifestJSON)
+	if err != nil {
+		return "", err
+	}
+	dataAEAD, err := newAEAD(secret, "data-key")
+	if err != nil {
+		return "", err
+	}
+	plans, payloadSize, err := buildChunkPlan(manifest, sources, dataAEAD.Overhead()+dataAEAD.NonceSize())
+	if err != nil {
+		return "", err
+	}
+	session := protocol.SessionMeta{
+		TransferID: transferID(encryptedManifest), PlainSize: manifest.TotalSize,
+		PayloadSize: payloadSize, EncryptedManifest: encryptedManifest,
+	}
+	if len(encryptedManifest) > protocol.MaxFrameSize/2 {
+		return "", fmt.Errorf("encrypted manifest juda katta: %s", HumanBytes(int64(len(encryptedManifest))))
+	}
 
 	room := ""
+	code := ""
 	for attempt := 0; attempt <= maxResumeAttempts; attempt++ {
 		conn, err := cfg.dial()
 		if err != nil {
@@ -99,16 +109,12 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 				printRetry("serverga qayta ulanish", attempt, err)
 				continue
 			}
-			return room, err
+			return code, err
 		}
-
-		if cfg.IOTimeout <= 0 {
-			cfg.IOTimeout = 2 * time.Hour
-		}
-		_ = conn.SetDeadline(time.Now().Add(cfg.IOTimeout))
+		_ = conn.SetDeadline(time.Now().Add(effectiveIOTimeout(cfg)))
 
 		if room == "" {
-			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeCreate, File: &meta})
+			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeCreate, Session: &session})
 			if err == nil {
 				var created protocol.Message
 				created, err = protocol.ReadMessage(conn)
@@ -120,18 +126,26 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 						err = errors.New("unexpected create response")
 					default:
 						room = created.Room
+						code = encodeTransferCode(room, secret)
 						if cfg.OnRoomCreated != nil {
 							cfg.OnRoomCreated(room)
 						}
-						fmt.Printf("\n==============================================\n")
-						fmt.Printf(" XONA KODI: %s\n", room)
-						fmt.Printf(" Qabul qiluvchiga shu kodni yuboring.\n")
-						fmt.Printf("==============================================\n\n")
+						if cfg.OnTransferCode != nil {
+							cfg.OnTransferCode(code)
+						}
+						fmt.Printf("\n==============================================================\n")
+						fmt.Printf(" TRANSFER CODE:\n %s\n", code)
+						fmt.Printf("==============================================================\n")
+						fmt.Println("[🔒] End-to-end encryption: AES-256-GCM")
+						fmt.Println("[i] To'liq code'ni qabul qiluvchiga bering; SECRET serverga yuborilmaydi.")
+						fmt.Println()
 					}
 				}
 			}
 		} else {
-			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeResumeSend, Room: room, File: &meta})
+			resumeMeta := session
+			resumeMeta.EncryptedManifest = nil
+			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeResumeSend, Room: room, Session: &resumeMeta})
 			if err == nil {
 				var resumed protocol.Message
 				resumed, err = protocol.ReadMessage(conn)
@@ -139,7 +153,7 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 					switch resumed.Type {
 					case protocol.TypeComplete:
 						_ = conn.Close()
-						return room, nil
+						return code, nil
 					case protocol.TypeError:
 						err = errors.New(resumed.Text)
 					case protocol.TypeJoined:
@@ -157,7 +171,7 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 				printRetry("sender reconnect", attempt, err)
 				continue
 			}
-			return room, err
+			return code, err
 		}
 
 		ready, err := protocol.ReadMessage(conn)
@@ -167,56 +181,45 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 				printRetry("receiver kutilayotganda connection uzildi", attempt, err)
 				continue
 			}
-			return room, err
+			return code, err
 		}
 		if ready.Type == protocol.TypeComplete {
 			_ = conn.Close()
-			return room, nil
+			return code, nil
 		}
 		if ready.Type == protocol.TypeError {
 			_ = conn.Close()
-			return room, errors.New(ready.Text)
+			return code, errors.New(ready.Text)
 		}
 		if ready.Type != protocol.TypePeerReady {
 			_ = conn.Close()
-			return room, errors.New("unexpected peer-ready response")
+			return code, errors.New("unexpected peer-ready response")
 		}
 
-		offset := ready.Offset
-		if offset < 0 || offset > meta.Size {
+		planIndex, err := chunkIndexForCipherOffset(plans, session.PayloadSize, ready.Offset)
+		if err != nil {
 			_ = conn.Close()
-			return room, fmt.Errorf("server returned invalid resume offset: %d", offset)
+			return code, err
 		}
-		if offset > 0 {
-			fmt.Printf("[↻] Resume: %s dan davom etadi (%5.2f%%)\n", HumanBytes(offset), percentage(offset, meta.Size))
-		}
-
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			_ = conn.Close()
-			return room, err
+		plainBase := plainDoneAtPlanIndex(plans, planIndex, manifest.TotalSize)
+		if ready.Offset > 0 {
+			fmt.Printf("[↻] Resume: %s dan davom etadi (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize))
 		}
 
-		progress := NewProgressWriter("Yuborish", meta.Size, offset)
-		buf, put := getTransferBuffer()
-		remaining := meta.Size - offset
-		written, copyErr := io.CopyBuffer(io.MultiWriter(conn, progress), io.LimitReader(f, remaining), *buf)
-		put()
+		progress := NewProgressWriter("Yuborish", manifest.TotalSize, plainBase)
+		sendErr := sendEncryptedChunks(conn, dataAEAD, plans, planIndex, progress)
 		progress.Finish()
-
-		if copyErr != nil || written != remaining {
-			if copyErr == nil {
-				copyErr = fmt.Errorf("short send: %d/%d bytes", written, remaining)
-			}
+		if sendErr != nil {
 			done, elapsed, avg := progress.Snapshot()
 			fmt.Printf("[!] Transfer uzildi: %s / %s | %s | o'rtacha %s/s\n",
-				HumanBytes(done), HumanBytes(meta.Size), HumanDuration(elapsed), HumanBytes(int64(avg)))
-			fmt.Printf("[!] Sabab: %s\n", networkErrorSummary(copyErr))
+				HumanBytes(done), HumanBytes(manifest.TotalSize), HumanDuration(elapsed), HumanBytes(int64(avg)))
+			fmt.Printf("[!] Sabab: %s\n", networkErrorSummary(sendErr))
 			_ = conn.Close()
-			if attempt < maxResumeAttempts && isRetryableNetworkError(copyErr) {
-				printRetry("avtomatik resume", attempt, copyErr)
+			if attempt < maxResumeAttempts && isRetryableNetworkError(sendErr) {
+				printRetry("avtomatik resume", attempt, sendErr)
 				continue
 			}
-			return room, copyErr
+			return code, sendErr
 		}
 
 		result, err := protocol.ReadMessage(conn)
@@ -226,34 +229,90 @@ func SendFile(cfg ClientConfig, path string) (string, error) {
 				printRetry("tasdiq kutilayotganda connection uzildi", attempt, err)
 				continue
 			}
-			return room, err
+			return code, err
 		}
 		if result.Type == protocol.TypeComplete {
-			return room, nil
+			return code, nil
 		}
 		if result.Type == protocol.TypeError {
-			return room, errors.New(result.Text)
+			return code, errors.New(result.Text)
 		}
-		return room, errors.New("transfer completion was not confirmed")
+		return code, errors.New("transfer completion was not confirmed")
 	}
-
-	return room, errors.New("resume attempts exhausted")
+	return code, errors.New("resume attempts exhausted")
 }
 
-func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
-	room = strings.ToUpper(strings.TrimSpace(room))
-	if room == "" {
-		return "", errors.New("room code required")
+func sendEncryptedChunks(conn net.Conn, aead cipher.AEAD, plans []chunkPlan, start int, progress *ProgressWriter) error {
+	var currentPath string
+	var f *os.File
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
+
+	plainBuf := make([]byte, defaultChunkSize)
+	cipherBuf := make([]byte, 0, defaultChunkSize+aead.Overhead())
+
+	for i := start; i < len(plans); i++ {
+		p := plans[i]
+		if p.LocalPath == "" {
+			return fmt.Errorf("source mapping topilmadi: %s", p.ManifestPath)
+		}
+		if currentPath != p.LocalPath {
+			if f != nil {
+				_ = f.Close()
+			}
+			var err error
+			f, err = os.Open(p.LocalPath)
+			if err != nil {
+				return err
+			}
+			currentPath = p.LocalPath
+		}
+		if _, err := f.Seek(p.FileOffset, io.SeekStart); err != nil {
+			return err
+		}
+		plain := plainBuf[:p.PlainSize]
+		if _, err := io.ReadFull(f, plain); err != nil {
+			return fmt.Errorf("source file transfer paytida o'zgargan yoki o'qilmadi (%s): %w", p.ManifestPath, err)
+		}
+		nonce := make([]byte, aead.NonceSize())
+		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+			return err
+		}
+		sealed := aead.Seal(cipherBuf[:0], nonce, plain, chunkAAD(p.Index, p.PlainSize))
+		record := make([]byte, 0, len(nonce)+len(sealed))
+		record = append(record, nonce...)
+		record = append(record, sealed...)
+		if int64(len(record)) != p.CipherSize {
+			return errors.New("internal encrypted chunk size mismatch")
+		}
+		if err := writeAll(conn, record); err != nil {
+			return err
+		}
+		progress.Add(int64(p.PlainSize))
+	}
+	return nil
+}
+
+func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string, error) {
+	room, secret, err := parseTransferCode(transferCode)
+	if err != nil {
+		return nil, err
 	}
 	if outputDir == "" {
 		outputDir = "."
 	}
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	tmpPath := filepath.Join(outputDir, ".protransfer-"+room+".part")
-	var expectedMeta *protocol.FileMeta
+	var session *protocol.SessionMeta
+	var manifest Manifest
+	var plans []chunkPlan
+	var dataAEAD cipher.AEAD
+	var staging *receiverStaging
 
 	for attempt := 0; attempt <= maxResumeAttempts; attempt++ {
 		conn, err := cfg.dial()
@@ -262,15 +321,12 @@ func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
 				printRetry("serverga qayta ulanish", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
-		if cfg.IOTimeout <= 0 {
-			cfg.IOTimeout = 2 * time.Hour
-		}
-		_ = conn.SetDeadline(time.Now().Add(cfg.IOTimeout))
+		_ = conn.SetDeadline(time.Now().Add(effectiveIOTimeout(cfg)))
 
 		msgType := protocol.TypeJoin
-		if expectedMeta != nil {
+		if session != nil {
 			msgType = protocol.TypeResumeReceive
 		}
 		if err := protocol.WriteMessage(conn, protocol.Message{Type: msgType, Room: room}); err != nil {
@@ -279,7 +335,7 @@ func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
 				printRetry("receiver reconnect", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 
 		joined, err := protocol.ReadMessage(conn)
@@ -289,164 +345,141 @@ func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
 				printRetry("join javobida connection uzildi", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 		if joined.Type == protocol.TypeComplete {
 			_ = conn.Close()
-			// This can happen only if the previous connection completed and the
-			// acknowledgement was lost. The .part file is finalized below after
-			// metadata has been seen in a previous attempt.
-			if expectedMeta == nil {
-				return "", errors.New("server reports complete but local metadata is missing")
+			if staging == nil || session == nil {
+				return nil, errors.New("server complete dedi, lekin lokal resume state topilmadi")
 			}
-			return finalizeReceivedFile(tmpPath, outputDir, *expectedMeta)
+			if err := verifyStaging(staging.contentDir, manifest); err != nil {
+				return nil, err
+			}
+			return finalizeStaging(staging, outputDir, manifest)
 		}
 		if joined.Type == protocol.TypeError {
 			_ = conn.Close()
-			return "", errors.New(joined.Text)
+			return nil, errors.New(joined.Text)
 		}
-		if joined.Type != protocol.TypeJoined || joined.File == nil {
+		if joined.Type != protocol.TypeJoined || joined.Session == nil {
 			_ = conn.Close()
-			return "", errors.New("invalid join response")
+			return nil, errors.New("unexpected join response")
 		}
-		meta := *joined.File
-		if meta.Size < 0 || len(meta.SHA256) != 64 {
-			_ = conn.Close()
-			return "", errors.New("invalid file metadata values")
-		}
-		if expectedMeta != nil && (expectedMeta.Size != meta.Size || expectedMeta.SHA256 != meta.SHA256 || expectedMeta.Name != meta.Name) {
-			_ = conn.Close()
-			return "", errors.New("room metadata changed during resume")
-		}
-		expectedMeta = &meta
 
-		part, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			_ = conn.Close()
-			return "", err
-		}
-		st, err := part.Stat()
-		if err != nil {
-			_ = part.Close()
-			_ = conn.Close()
-			return "", err
-		}
-		offset := st.Size()
-		if offset < 0 || offset > meta.Size {
-			if err := part.Truncate(0); err != nil {
-				_ = part.Close()
+		if session == nil {
+			s := *joined.Session
+			if transferID(s.EncryptedManifest) != s.TransferID {
 				_ = conn.Close()
-				return "", err
+				return nil, errors.New("encrypted manifest transfer_id mismatch")
 			}
-			offset = 0
+			plainManifest, err := decryptManifest(secret, s.EncryptedManifest)
+			if err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("SECRET noto'g'ri yoki manifest buzilgan: %w", err)
+			}
+			manifest, err = unmarshalManifest(plainManifest)
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			if manifest.TotalSize != s.PlainSize {
+				_ = conn.Close()
+				return nil, errors.New("session plain_size manifest bilan mos emas")
+			}
+			dataAEAD, err = newAEAD(secret, "data-key")
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			var payloadSize int64
+			plans, payloadSize, err = buildChunkPlan(manifest, nil, dataAEAD.Overhead()+dataAEAD.NonceSize())
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			if payloadSize != s.PayloadSize {
+				_ = conn.Close()
+				return nil, errors.New("session payload_size manifest bilan mos emas")
+			}
+			session = &s
+			files, dirs := manifestCounts(manifest)
+			fmt.Printf("[i] %d ta fayl, %d ta folder | Jami: %s\n", files, dirs, HumanBytes(manifest.TotalSize))
+			fmt.Println("[🔒] End-to-end encryption tasdiqlandi. Manifest decrypt qilindi.")
+		} else if joined.Session.TransferID != session.TransferID || joined.Session.PayloadSize != session.PayloadSize || joined.Session.PlainSize != session.PlainSize {
+			_ = conn.Close()
+			return nil, errors.New("resume session original transfer bilan mos emas")
 		}
 
-		if attempt == 0 {
-			fmt.Printf("[i] Fayl: %s | Hajmi: %s\n", SafeFilename(meta.Name), HumanBytes(meta.Size))
-		} else {
-			fmt.Printf("[↻] Receiver resume: lokal .part = %s (%5.2f%%)\n", HumanBytes(offset), percentage(offset, meta.Size))
+		staging, _, err = openReceiverStaging(outputDir, room, session.TransferID, manifest, plans, session.PayloadSize)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		planIndex, err := chunkIndexForCipherOffset(plans, session.PayloadSize, staging.state.CipherOffset)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		plainBase := plainDoneAtPlanIndex(plans, planIndex, manifest.TotalSize)
+		if staging.state.CipherOffset > 0 {
+			fmt.Printf("[↻] Receiver resume: lokal state = %s (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize))
 		}
 
-		if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeReceiverReady, Room: room, Offset: offset}); err != nil {
-			_ = part.Close()
+		if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeReceiverReady, Room: room, Offset: staging.state.CipherOffset}); err != nil {
 			_ = conn.Close()
 			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
-				printRetry("resume offset yuborishda uzildi", attempt, err)
+				printRetry("receiver ready yuborishda connection uzildi", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 
 		ready, err := protocol.ReadMessage(conn)
 		if err != nil {
-			_ = part.Close()
 			_ = conn.Close()
 			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
 				printRetry("sender kutilayotganda connection uzildi", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 		if ready.Type == protocol.TypeComplete {
-			_ = part.Close()
 			_ = conn.Close()
-			return finalizeReceivedFile(tmpPath, outputDir, meta)
+			if err := verifyStaging(staging.contentDir, manifest); err != nil {
+				return nil, err
+			}
+			return finalizeStaging(staging, outputDir, manifest)
 		}
 		if ready.Type == protocol.TypeError {
-			_ = part.Close()
 			_ = conn.Close()
-			return "", errors.New(ready.Text)
+			return nil, errors.New(ready.Text)
 		}
-		if ready.Type != protocol.TypePeerReady {
-			_ = part.Close()
+		if ready.Type != protocol.TypePeerReady || ready.Offset != staging.state.CipherOffset {
 			_ = conn.Close()
-			return "", errors.New("unexpected peer-ready response")
-		}
-		if ready.Offset < 0 || ready.Offset > offset {
-			_ = part.Close()
-			_ = conn.Close()
-			return "", fmt.Errorf("server returned invalid receive offset: %d (local=%d)", ready.Offset, offset)
-		}
-		if ready.Offset != offset {
-			if err := part.Truncate(ready.Offset); err != nil {
-				_ = part.Close()
-				_ = conn.Close()
-				return "", err
-			}
-			offset = ready.Offset
-		}
-		if _, err := part.Seek(offset, io.SeekStart); err != nil {
-			_ = part.Close()
-			_ = conn.Close()
-			return "", err
+			return nil, errors.New("server noto'g'ri resume offset qaytardi")
 		}
 
-		progress := NewProgressWriter("Qabul qilish", meta.Size, offset)
-		buf, put := getTransferBuffer()
-		remaining := meta.Size - offset
-		written, copyErr := io.CopyBuffer(io.MultiWriter(part, progress), io.LimitReader(conn, remaining), *buf)
-		put()
+		progress := NewProgressWriter("Qabul qilish", manifest.TotalSize, plainBase)
+		recvErr := receiveEncryptedChunks(conn, dataAEAD, staging, plans, planIndex, progress)
 		progress.Finish()
-
-		if copyErr != nil || written != remaining {
-			if copyErr == nil {
-				copyErr = fmt.Errorf("receive interrupted after %d/%d bytes: %w", written, remaining, io.ErrUnexpectedEOF)
-			}
-			_ = part.Sync()
-			_ = part.Close()
-			_ = conn.Close()
+		if recvErr != nil {
 			done, elapsed, avg := progress.Snapshot()
 			fmt.Printf("[!] Qabul uzildi: %s / %s | %s | o'rtacha %s/s\n",
-				HumanBytes(done), HumanBytes(meta.Size), HumanDuration(elapsed), HumanBytes(int64(avg)))
-			fmt.Printf("[!] Sabab: %s\n", networkErrorSummary(copyErr))
-			if attempt < maxResumeAttempts && isRetryableNetworkError(copyErr) {
-				printRetry("avtomatik resume", attempt, copyErr)
+				HumanBytes(done), HumanBytes(manifest.TotalSize), HumanDuration(elapsed), HumanBytes(int64(avg)))
+			fmt.Printf("[!] Sabab: %s\n", networkErrorSummary(recvErr))
+			_ = conn.Close()
+			if attempt < maxResumeAttempts && isRetryableNetworkError(recvErr) {
+				printRetry("avtomatik resume", attempt, recvErr)
 				continue
 			}
-			return "", copyErr
+			return nil, recvErr
 		}
 
-		if err := part.Sync(); err != nil {
-			_ = part.Close()
+		fmt.Println("[i] Barcha fayllar SHA-256 bo'yicha tekshirilmoqda...")
+		if err := verifyStaging(staging.contentDir, manifest); err != nil {
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Room: room, Text: "integrity verification failed"})
 			_ = conn.Close()
-			return "", err
-		}
-		if err := part.Close(); err != nil {
-			_ = conn.Close()
-			return "", err
-		}
-
-		fmt.Println("[i] SHA-256 tekshirilmoqda...")
-		actualHash, err := FileSHA256(tmpPath)
-		if err != nil {
-			_ = conn.Close()
-			return "", err
-		}
-		if actualHash != meta.SHA256 {
-			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Room: room, Text: "sha256 mismatch"})
-			_ = conn.Close()
-			_ = os.Remove(tmpPath)
-			return "", fmt.Errorf("sha256 mismatch: expected %s, got %s", meta.SHA256, actualHash)
+			return nil, err
 		}
 		if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeVerified, Room: room}); err != nil {
 			_ = conn.Close()
@@ -454,9 +487,8 @@ func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
 				printRetry("verify tasdig'ida connection uzildi", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
-
 		result, err := protocol.ReadMessage(conn)
 		_ = conn.Close()
 		if err != nil {
@@ -464,47 +496,103 @@ func ReceiveFile(cfg ClientConfig, room, outputDir string) (string, error) {
 				printRetry("yakuniy tasdiqda connection uzildi", attempt, err)
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 		if result.Type == protocol.TypeError {
-			return "", errors.New(result.Text)
+			return nil, errors.New(result.Text)
 		}
 		if result.Type != protocol.TypeComplete {
-			return "", errors.New("transfer completion was not confirmed")
+			return nil, errors.New("transfer completion was not confirmed")
 		}
-		return finalizeReceivedFile(tmpPath, outputDir, meta)
+		return finalizeStaging(staging, outputDir, manifest)
 	}
-
-	return "", errors.New("resume attempts exhausted")
+	return nil, errors.New("resume attempts exhausted")
 }
 
-func finalizeReceivedFile(tmpPath, outputDir string, meta protocol.FileMeta) (string, error) {
-	st, err := os.Stat(tmpPath)
+func receiveEncryptedChunks(conn net.Conn, aead cipher.AEAD, staging *receiverStaging, plans []chunkPlan, start int, progress *ProgressWriter) error {
+	maxCipherSize := aead.Overhead()
+	for _, p := range plans {
+		if int(p.CipherSize) > maxCipherSize {
+			maxCipherSize = int(p.CipherSize)
+		}
+	}
+	cipherBuf := make([]byte, maxCipherSize)
+	var currentPath string
+	var f *os.File
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
+
+	for i := start; i < len(plans); i++ {
+		p := plans[i]
+		ciphertext := cipherBuf[:int(p.CipherSize)]
+		if _, err := io.ReadFull(conn, ciphertext); err != nil {
+			return err
+		}
+		if len(ciphertext) < aead.NonceSize()+aead.Overhead() {
+			return errors.New("encrypted chunk record juda qisqa")
+		}
+		nonce := ciphertext[:aead.NonceSize()]
+		sealed := ciphertext[aead.NonceSize():]
+		plaintext, err := aead.Open(nil, nonce, sealed, chunkAAD(p.Index, p.PlainSize))
+		if err != nil {
+			return fmt.Errorf("encrypted chunk authentication failed (#%d): %w", p.Index, err)
+		}
+		if len(plaintext) != p.PlainSize {
+			return errors.New("decrypted chunk size mismatch")
+		}
+
+		target, err := safeOutputPath(staging.contentDir, p.ManifestPath)
+		if err != nil {
+			return err
+		}
+		if currentPath != target {
+			if f != nil {
+				_ = f.Close()
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err = os.OpenFile(target, os.O_CREATE|os.O_RDWR, 0o600)
+			if err != nil {
+				return err
+			}
+			currentPath = target
+		}
+		if _, err := f.WriteAt(plaintext, p.FileOffset); err != nil {
+			return err
+		}
+		nextOffset := p.CipherOffset + p.CipherSize
+		if err := staging.commitOffset(nextOffset); err != nil {
+			return err
+		}
+		progress.Add(int64(p.PlainSize))
+	}
+	return nil
+}
+
+func SendFile(cfg ClientConfig, path string) (string, error) {
+	return SendPaths(cfg, []string{path})
+}
+
+func ReceiveFile(cfg ClientConfig, transferCode, outputDir string) (string, error) {
+	paths, err := ReceiveTransfer(cfg, transferCode, outputDir)
 	if err != nil {
 		return "", err
 	}
-	if st.Size() != meta.Size {
-		return "", fmt.Errorf("partial file size mismatch: have %d, expected %d", st.Size(), meta.Size)
+	if len(paths) == 0 {
+		return outputDir, nil
 	}
-	finalPath := uniquePath(filepath.Join(outputDir, SafeFilename(meta.Name)))
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		return "", err
-	}
-	return finalPath, nil
+	return paths[0], nil
 }
 
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
+func effectiveIOTimeout(cfg ClientConfig) time.Duration {
+	if cfg.IOTimeout <= 0 {
+		return 2 * time.Hour
 	}
-	ext := filepath.Ext(path)
-	base := path[:len(path)-len(ext)]
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
+	return cfg.IOTimeout
 }
 
 func percentage(done, total int64) float64 {
@@ -522,4 +610,25 @@ func printRetry(action string, attempt int, err error) {
 	fmt.Printf("[↻] %s: %s. %s dan keyin qayta uriniladi (%d/%d)...\n",
 		action, networkErrorSummary(err), delay.Round(time.Millisecond), attempt+1, maxResumeAttempts)
 	time.Sleep(delay)
+}
+
+func manifestCounts(m Manifest) (files, dirs int) {
+	for _, e := range m.Entries {
+		if e.Type == "file" {
+			files++
+		} else if e.Type == "dir" {
+			dirs++
+		}
+	}
+	return
+}
+
+func normalizeInputs(inputs []string) []string {
+	out := make([]string, 0, len(inputs))
+	for _, p := range inputs {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

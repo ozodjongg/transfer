@@ -10,30 +10,23 @@ import (
 )
 
 func main() {
-	// On Windows, make the CLI available from any newly opened terminal without
-	// asking the user to edit PATH manually. This writes only to User PATH, so
-	// administrator privileges are not required.
 	if added, dir, err := ensureExecutableOnUserPath(); err != nil {
 		fmt.Fprintf(os.Stderr, "[!] PATH avtomatik sozlanmadi: %v\n", err)
 	} else if added {
-		fmt.Printf("[i] Client Windows User PATH'iga qo'shildi: %s\n", dir)
-		fmt.Println("[i] 'client' komandasini ishlatish uchun yangi CMD/PowerShell oynasini oching.")
+		fmt.Printf("[i] Transfer Windows User PATH'iga qo'shildi: %s\n", dir)
+		fmt.Println("[i] 'transfer' komandasini ishlatish uchun yangi CMD/PowerShell oynasini oching.")
 	}
 
-	// Config is ensured before parsing commands so even the first bare launch
-	// (for example, double-clicking client.exe) creates config.json next to
-	// the executable.
-	path := configPath()
-	created, err := ensureConfigFile(path)
+	configFile := configPath()
+	created, err := ensureConfigFile(configFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[x] Config yaratilmadi: %v\n", err)
 		os.Exit(1)
 	}
 	if created {
-		fmt.Printf("[i] Default config.json yaratildi: %s\n", path)
+		fmt.Printf("[i] Default config.json yaratildi: %s\n", configFile)
 	}
-
-	cfg, err := loadAppConfig(path)
+	cfg, err := loadAppConfig(configFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[x] %v\n", err)
 		os.Exit(1)
@@ -43,52 +36,54 @@ func main() {
 		usage()
 		return
 	}
-
 	switch strings.ToLower(os.Args[1]) {
 	case "send", "sender", "s":
-		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: client send <file>")
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: transfer send <file-or-folder> [more files/folders...]")
 			os.Exit(2)
 		}
-		runSend(cfg, os.Args[2])
+		runSend(cfg, os.Args[2:])
 	case "receive", "receiver", "recv", "r":
 		if len(os.Args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: client receive <room-code>")
+			fmt.Fprintln(os.Stderr, "usage: transfer receive <TRANSFER-CODE>")
 			os.Exit(2)
 		}
 		runReceive(cfg, os.Args[2])
 	case "config":
-		showConfig(path, cfg)
+		showConfig(configFile, cfg)
 	default:
 		usage()
 		os.Exit(2)
 	}
 }
 
-func runSend(appCfg AppConfig, filePath string) {
+func runSend(appCfg AppConfig, paths []string) {
 	cfg, err := appCfg.transferConfig()
 	if err != nil {
 		fatalConfig(err)
 	}
-	room, err := transfer.SendFile(cfg, filePath)
+	code, err := transfer.SendPaths(cfg, paths)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[x] Yuborish xatosi (room=%s): %v\n", room, err)
+		fmt.Fprintf(os.Stderr, "[x] Yuborish xatosi (code=%s): %v\n", code, err)
 		os.Exit(1)
 	}
-	fmt.Println("[✓] Fayl muvaffaqiyatli yetkazildi.")
+	fmt.Println("[✓] Transfer muvaffaqiyatli yetkazildi.")
 }
 
-func runReceive(appCfg AppConfig, room string) {
+func runReceive(appCfg AppConfig, code string) {
 	cfg, err := appCfg.transferConfig()
 	if err != nil {
 		fatalConfig(err)
 	}
-	path, err := transfer.ReceiveFile(cfg, strings.ToUpper(strings.TrimSpace(room)), appCfg.DownloadDir)
+	paths, err := transfer.ReceiveTransfer(cfg, code, appCfg.DownloadDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[x] Qabul qilish xatosi: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("[✓] Fayl saqlandi: %s\n", path)
+	fmt.Println("[✓] Transfer saqlandi:")
+	for _, p := range paths {
+		fmt.Printf("    %s\n", p)
+	}
 }
 
 func showConfig(path string, cfg AppConfig) {
@@ -102,21 +97,22 @@ func fatalConfig(err error) {
 }
 
 func usage() {
-	fmt.Print(`Pro Transfer Client
+	fmt.Print(`Pro Transfer v5
 
 Yuborish:
-  client send <file>
+  transfer send <file-or-folder> [more files/folders...]
 
 Qabul qilish:
-  client receive <room-code>
+  transfer receive <TRANSFER-CODE>
 
-Joriy sozlamani ko'rish:
-  client config
+Joriy sozlama:
+  transfer config
 
-Sozlamalar client yonidagi config.json faylidan olinadi.
+Misollar:
+  transfer send report.xlsx
+  transfer send report.xlsx photo.jpg "D:\My Project"
+  transfer receive BHTP8AH7XN.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-Misol:
-  client send report.xlsx
-  client receive AB7K4M9Q2X
+V5: multiple files/folders + end-to-end AES-256-GCM + resume.
 `)
 }

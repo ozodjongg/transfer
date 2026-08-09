@@ -18,12 +18,14 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	maxFileGB := flag.Int64("max-file-gb", 10, "maximum file size in GiB")
+	maxTransferGB := flag.Int64("max-transfer-gb", 10, "maximum total transfer size in GiB")
 	roomTTL := flag.Duration("room-ttl", 10*time.Minute, "room waiting lifetime")
 	transferTimeout := flag.Duration("transfer-timeout", 2*time.Hour, "maximum transfer duration")
 	resumeGrace := flag.Duration("resume-grace", 2*time.Minute, "how long a broken room remains resumable")
-	maxConnections := flag.Int("max-connections", 512, "maximum simultaneous TCP connections")
-	maxHandshakes := flag.Int("max-handshakes-per-minute", 120, "maximum new handshakes per IP per minute")
+	maxRooms := flag.Int("max-rooms", 100, "maximum simultaneous rooms")
+	maxManifestMB := flag.Int("max-manifest-mb", 2, "maximum encrypted manifest size in MiB")
+	maxConnections := flag.Int("max-connections", 240, "maximum simultaneous TCP connections")
+	maxHandshakes := flag.Int("max-handshakes-per-minute", 600, "maximum new handshakes per IP per minute")
 	certFile := flag.String("tls-cert", "", "TLS certificate PEM file")
 	keyFile := flag.String("tls-key", "", "TLS private key PEM file")
 	flag.Parse()
@@ -48,7 +50,9 @@ func main() {
 		RoomTTL:                *roomTTL,
 		TransferTimeout:        *transferTimeout,
 		ResumeGrace:            *resumeGrace,
-		MaxFileSize:            *maxFileGB << 30,
+		MaxTransferSize:        *maxTransferGB << 30,
+		MaxEncryptedManifest:   *maxManifestMB * 1024 * 1024,
+		MaxRooms:               *maxRooms,
 		MaxConnections:         *maxConnections,
 		MaxHandshakesPerMinute: *maxHandshakes,
 		TLSConfig:              tlsConfig,
@@ -57,7 +61,6 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 

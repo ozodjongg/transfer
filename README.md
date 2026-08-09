@@ -1,33 +1,171 @@
-# Pro Transfer v4
+# Pro Transfer v5
 
-Room-code based one-to-one file transfer service written in Go.
+Secure, room-code based one-to-one transfer utility written in Go.
+
+## V5 highlights
 
 - 1 sender + 1 receiver per room
-- no authentication/accounts
-- server does not persist transferred files
-- streaming transfer (file is not loaded into RAM)
-- automatic reconnect + resume after temporary TCP resets
-- SHA-256 end-to-end integrity verification
-- live speed, ETA and transferred-byte diagnostics
-- optimized 1 MiB reusable transfer buffers
-- TCP keepalive / larger socket buffers
+- multiple files in one transfer
+- whole folder transfer, including nested and empty folders
+- no manual ZIP/unzip required
+- end-to-end AES-256-GCM encryption
+- encrypted manifest: server cannot read file names, folder names or SHA-256 values
+- server never receives the transfer secret
+- authenticated encrypted chunks with fresh random nonces
+- automatic reconnect + chunk-boundary resume
+- SHA-256 verification of every received file
+- no server-side file storage
+- streaming; files are never loaded fully into RAM
+- live progress / speed / ETA
+- symlinks rejected
+- path traversal protection on receive
+- automatic `config.json` creation
+- Windows User PATH auto-registration
 - Railway-ready Dockerfile
 
-## Windows client
+## Command line
 
-On first launch `client.exe`:
-
-1. creates `config.json` next to itself if it does not exist;
-2. adds its own directory to the current Windows user's PATH;
-3. does not require administrator privileges.
-
-After opening a new terminal:
+Send one file:
 
 ```powershell
-client send D:\Files\report.xlsx
-client receive AB7K4M9Q2X
-client config
+transfer send report.xlsx
 ```
+
+Send multiple files:
+
+```powershell
+transfer send report.xlsx photo.jpg data.csv
+```
+
+Send a folder:
+
+```powershell
+transfer send "D:\Projects\My Project"
+```
+
+Mix files and folders:
+
+```powershell
+transfer send report.xlsx "D:\Projects\My Project" photo.jpg
+```
+
+The sender prints a transfer code like:
+
+```text
+BHTP8AH7XN.QWertY...<secret>...
+```
+
+Receive:
+
+```powershell
+transfer receive BHTP8AH7XN.QWertY...<secret>...
+```
+
+The complete `ROOM.SECRET` value must be shared with the receiver. Only the `ROOM`
+part is sent to the relay server; the secret stays between sender and receiver.
+
+## End-to-end encryption
+
+V5 generates a fresh random 256-bit transfer secret for every transfer.
+Two independent AES-256-GCM keys are derived from it:
+
+- one for the manifest;
+- one for file payload chunks.
+
+The encrypted manifest contains paths, directory structure, sizes and per-file SHA-256
+hashes. The relay receives only ciphertext plus aggregate transfer sizes.
+
+Conceptually:
+
+```text
+Sender                                Relay                                Receiver
+------                                -----                                --------
+files/folders
+   |
+manifest -> AES-256-GCM  ----------> encrypted manifest ----------------> decrypt manifest
+   |
+file chunks -> AES-256-GCM ---------> ciphertext only -------------------> authenticate/decrypt
+                                                                          |
+                                                                      recreate folders
+                                                                      write files
+                                                                      SHA-256 verify
+```
+
+TLS can still be enabled in `config.json`; E2E encryption protects file content even when
+TLS is disabled. TLS additionally protects transport metadata such as room IDs and aggregate
+sizes from passive network observers.
+
+## Resume
+
+Payload is encrypted in independent authenticated chunks (default 512 KiB plaintext per
+chunk). Every transmission of a chunk uses a fresh random AES-GCM nonce, including retries. Receiver state is persisted inside a hidden staging directory:
+
+```text
+downloads/
+└── .protransfer-<room>-<transfer-id>/
+    ├── state.json
+    └── content/
+```
+
+Only a fully received and successfully authenticated chunk advances `state.json`.
+If TCP is reset in the middle of a chunk, that chunk is retransmitted after reconnect.
+Completed chunks are not sent again.
+
+Example:
+
+```text
+[!] Transfer uzildi: 18.0 MiB / 100.0 MiB
+[↻] avtomatik resume ...
+[↻] Receiver resume: lokal state = 17.5 MiB (17.50%)
+[↻] Resume: 17.5 MiB dan davom etadi (17.50%)
+```
+
+The relay itself still stores no transferred files.
+
+## Folder behavior
+
+A source folder is reconstructed with the same root name and relative structure.
+Empty folders and zero-byte files are preserved.
+
+Example:
+
+```text
+transfer send report.xlsx "D:\Project"
+```
+
+Receiver result:
+
+```text
+downloads/
+├── report.xlsx
+└── Project/
+    ├── src/
+    ├── images/
+    └── empty-folder/
+```
+
+If a destination root already exists, a unique name such as `Project (1)` is selected.
+
+## Security rules
+
+- symlinks are rejected rather than followed;
+- absolute paths are rejected;
+- `..` path traversal is rejected;
+- duplicate/colliding manifest paths are rejected;
+- every encrypted chunk is authenticated before being written;
+- every final file is verified with SHA-256;
+- wrong transfer secrets cannot decrypt the manifest;
+- server logs do not contain file/folder names.
+
+## Windows client behavior
+
+On first launch `transfer.exe`:
+
+1. creates `config.json` next to the executable if missing;
+2. adds its executable directory to Windows **User PATH**;
+3. does not require administrator rights.
+
+Open a new terminal after the first launch, then use `transfer` from any directory.
 
 Default config:
 
@@ -47,46 +185,15 @@ Default config:
 }
 ```
 
-If you dont have server, use our server, replace `server` with the public TCP Proxy endpoint, for example:
+For Railway replace `server` with your public TCP Proxy endpoint:
 
 ```json
-"server": "turntable.proxy.rlwy.net:18473"
+"server": "your-proxy.proxy.rlwy.net:12345"
 ```
-
-## Automatic resume
-
-If a TCP connection is reset during a transfer, both clients automatically reconnect.
-The receiver keeps a deterministic temporary file:
-
-```text
-.protransfer-ROOMCODE.part
-```
-
-The receiver reports the number of bytes actually present in that file. The sender seeks
-to that byte offset and continues from there. The relay server itself still stores no file.
-
-Example:
-
-```text
-[!] Transfer uzildi: 19.7 MiB / 34.1 MiB
-[↻] avtomatik resume ...
-[↻] Resume: 19.4 MiB dan davom etadi (56.89%)
-Yuborish:  72.13% | 24.6 MiB / 34.1 MiB | 4.8 MiB/s | ETA 00:02
-```
-
-The receiver's local `.part` size is authoritative because it represents bytes that were
-actually written on the receiving machine.
-
-Default resume behavior:
-
-- up to 8 automatic reconnect attempts in the client;
-- increasing retry delay (up to 8 seconds);
-- server keeps an interrupted room resumable for 2 minutes by default;
-- a completed room is cached briefly so a lost final acknowledgement can still recover.
 
 ## Server
 
-Local:
+Run locally:
 
 ```bash
 ./server -addr :8080
@@ -96,15 +203,17 @@ Important options:
 
 ```text
 -addr :8080
--max-file-gb 10
+-max-transfer-gb 10
 -room-ttl 10m
 -transfer-timeout 2h
 -resume-grace 2m
--max-connections 512
--max-handshakes-per-minute 120
+-max-rooms 100
+-max-manifest-mb 2
+-max-connections 240
+-max-handshakes-per-minute 600
 ```
 
-Optional TLS:
+Optional transport TLS:
 
 ```bash
 ./server \
@@ -113,92 +222,93 @@ Optional TLS:
   -tls-key privkey.pem
 ```
 
-## Railway deployment
+## Railway
 
-The included multi-stage `Dockerfile` builds and runs only the server binary.
-
-1. Push the repository to GitHub.
+1. Push this repository to GitHub.
 2. Create a Railway service from the repository.
-3. Railway detects the `Dockerfile` and builds it automatically.
-4. In **Settings -> Networking**, choose **TCP Proxy**.
-5. Set target/internal port to `8080`.
-6. Copy the generated public `hostname:port` into the Windows client's `config.json`.
-7. Keep the service at **1 replica**, because room state is intentionally in-memory.
+3. Railway builds the included `Dockerfile` automatically.
+4. Open **Settings -> Networking -> TCP Proxy**.
+5. Set internal/target port to `8080`.
+6. Put the generated `hostname:port` into client `config.json`.
+7. Keep **1 replica** because room state is intentionally in process memory.
 
-## Transfer protocol v2
+The server stores only ephemeral room state and encrypted manifest ciphertext.
 
-Control messages are length-prefixed JSON frames:
+## Protocol v5
+
+Control frames:
 
 ```text
-uint32 big-endian frame length + JSON
+uint32 big-endian length + JSON
 ```
 
-The data payload itself remains raw streaming bytes.
+Encrypted payload bytes are relayed directly after the peer-ready handshake.
 
 Normal flow:
 
 ```text
-Sender                 Server                 Receiver
-  | CREATE + metadata    |                       |
-  |--------------------->|                       |
-  | CREATED + room       |                       |
-  |<---------------------|                       |
-  |                      |<----------- JOIN -----|
-  |                      |--- metadata/JOINED -->|
-  |                      |<- receiver_ready -----|
-  |<---- peer_ready -----|----- peer_ready ----->|
-  |====== raw bytes =====|====== raw bytes =====>|
-  |                      |<------ verified ------|
-  |<------ complete -----|------- complete ------>|
+Sender                    Server                    Receiver
+  | CREATE encrypted meta   |                         |
+  |------------------------>|                         |
+  | CREATED room            |                         |
+  |<------------------------|                         |
+  |                         |<---------- JOIN room ---|
+  |                         |-- encrypted manifest -->|
+  |                         |<- receiver_ready(offset)|
+  |<------ peer_ready ------|------ peer_ready ------>|
+  |==== encrypted chunks ===|==== encrypted chunks ==>|
+  |                         |<-------- verified ------|
+  |<------- complete -------|-------- complete ------>|
 ```
 
-Resume flow:
-
-```text
-TCP reset
-   |
-   +-- sender:   resume_send(room, same file metadata)
-   +-- receiver: resume_receive(room) + local .part offset
-   +-- server:   peer_ready(offset)
-   +-- sender:   seek(offset) and continue
-```
-
-## Integrity
-
-The sender calculates SHA-256 before creating the room. After all bytes are received,
-the receiver calculates SHA-256 over the completed `.part` file. The server sends final
-`complete` only after the receiver reports successful verification.
+The secret portion of the transfer code is never included in these server messages.
 
 ## Build
 
 ```bash
 make test
 make vet
-make build
-```
-
-Windows x64:
-
-```bash
 make windows
+make linux
 ```
 
-Output:
+Windows output:
 
 ```text
 bin/
-├── client.exe
+├── transfer.exe
+├── client.exe      # compatibility copy of transfer.exe
 ├── server.exe
 └── config.json
 ```
 
-## Tests
+Linux output:
+
+```text
+bin/
+├── transfer-linux-amd64
+└── server-linux-amd64
+```
+
+## Tests performed
+
+The test suite covers:
+
+- protocol frame round-trip;
+- transfer-code secret round-trip;
+- encrypted-manifest confidentiality / wrong-secret rejection;
+- multiple file + nested folder manifest generation;
+- empty folder preservation;
+- path traversal rejection;
+- full E2E encrypted transfer;
+- forced TCP disconnect during transfer;
+- automatic resume from an authenticated chunk boundary;
+- final byte-for-byte content verification.
+
+Run:
 
 ```bash
 go test ./...
+go test -race ./internal/transfer
 go vet ./...
 ```
-
-The test suite includes an end-to-end integration test that intentionally cuts the sender
-TCP connection during a transfer and verifies that reconnect + resume produces a byte-for-byte
-identical output file.

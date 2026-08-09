@@ -22,7 +22,9 @@ type ServerConfig struct {
 	RoomTTL                time.Duration
 	TransferTimeout        time.Duration
 	ResumeGrace            time.Duration
-	MaxFileSize            int64
+	MaxTransferSize        int64
+	MaxEncryptedManifest   int
+	MaxRooms               int
 	MaxConnections         int
 	MaxHandshakesPerMinute int
 	TLSConfig              *tls.Config
@@ -38,7 +40,6 @@ type peerConn struct {
 func newPeerConn(conn net.Conn) *peerConn {
 	return &peerConn{conn: conn, done: make(chan struct{})}
 }
-
 func (p *peerConn) close() {
 	if p == nil {
 		return
@@ -51,7 +52,7 @@ func (p *peerConn) close() {
 
 type room struct {
 	code      string
-	meta      protocol.FileMeta
+	session   protocol.SessionMeta
 	createdAt time.Time
 	expiresAt time.Time
 
@@ -81,6 +82,9 @@ type Server struct {
 }
 
 func NewServer(cfg ServerConfig) *Server {
+	if cfg.Addr == "" {
+		cfg.Addr = ":8080"
+	}
 	if cfg.RoomTTL <= 0 {
 		cfg.RoomTTL = 10 * time.Minute
 	}
@@ -90,23 +94,27 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.ResumeGrace <= 0 {
 		cfg.ResumeGrace = 2 * time.Minute
 	}
-	if cfg.MaxFileSize <= 0 {
-		cfg.MaxFileSize = 10 << 30
+	if cfg.MaxTransferSize <= 0 {
+		cfg.MaxTransferSize = 10 << 30
+	}
+	if cfg.MaxEncryptedManifest <= 0 {
+		cfg.MaxEncryptedManifest = 2 * 1024 * 1024
+	}
+	if cfg.MaxRooms <= 0 {
+		cfg.MaxRooms = 100
 	}
 	if cfg.MaxConnections <= 0 {
-		cfg.MaxConnections = 512
+		cfg.MaxConnections = 240
 	}
 	if cfg.MaxHandshakesPerMinute <= 0 {
-		cfg.MaxHandshakesPerMinute = 120
+		cfg.MaxHandshakesPerMinute = 600
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	return &Server{
-		cfg:   cfg,
-		rooms: make(map[string]*room),
-		rates: make(map[string]rateWindow),
-		sem:   make(chan struct{}, cfg.MaxConnections),
+		cfg: cfg, rooms: make(map[string]*room), rates: make(map[string]rateWindow),
+		sem: make(chan struct{}, cfg.MaxConnections),
 	}
 }
 
@@ -134,11 +142,8 @@ func (s *Server) ListenAndServe() error {
 	}()
 
 	s.cfg.Logger.Info("server started",
-		"addr", s.cfg.Addr,
-		"tls", s.cfg.TLSConfig != nil,
-		"protocol", protocol.Version,
-		"resume_grace", s.cfg.ResumeGrace,
-	)
+		"addr", s.cfg.Addr, "tls", s.cfg.TLSConfig != nil,
+		"protocol", protocol.Version, "e2e", true, "resume_grace", s.cfg.ResumeGrace)
 
 	for {
 		conn, err := ln.Accept()
@@ -150,7 +155,6 @@ func (s *Server) ListenAndServe() error {
 			continue
 		}
 		configureAcceptedConn(conn)
-
 		select {
 		case s.sem <- struct{}{}:
 			go func() {
@@ -185,18 +189,16 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-
 	msg, err := protocol.ReadMessage(conn)
 	if err != nil {
 		s.cfg.Logger.Warn("bad handshake", "remote", conn.RemoteAddr().String(), "error", err)
 		return
 	}
-
 	switch msg.Type {
 	case protocol.TypeCreate:
-		s.handleCreate(conn, msg.File)
+		s.handleCreate(conn, msg.Session)
 	case protocol.TypeResumeSend:
-		s.handleResumeSend(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.File)
+		s.handleResumeSend(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Session)
 	case protocol.TypeJoin:
 		s.handleReceiver(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), false)
 	case protocol.TypeResumeReceive:
@@ -206,23 +208,21 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) handleCreate(conn net.Conn, meta *protocol.FileMeta) {
-	if err := s.validateMeta(meta); err != nil {
+func (s *Server) handleCreate(conn net.Conn, session *protocol.SessionMeta) {
+	if err := s.validateSession(session, true); err != nil {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: err.Error()})
 		return
 	}
-
 	p := newPeerConn(conn)
 	now := time.Now()
-	r := &room{
-		meta:      *meta,
-		createdAt: now,
-		expiresAt: now.Add(s.cfg.RoomTTL),
-		sender:    p,
-		done:      make(chan struct{}),
-	}
+	r := &room{session: cloneSession(*session), createdAt: now, expiresAt: now.Add(s.cfg.RoomTTL), sender: p, done: make(chan struct{})}
 
 	s.mu.Lock()
+	if len(s.rooms) >= s.cfg.MaxRooms {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "server room capacity reached"})
+		return
+	}
 	for {
 		code, err := secureRoomCode(10)
 		if err != nil {
@@ -243,28 +243,23 @@ func (s *Server) handleCreate(conn net.Conn, meta *protocol.FileMeta) {
 		s.finishRoom(r, "sender disconnected before room acknowledgement")
 		return
 	}
-
 	s.cfg.Logger.Info("room created",
-		"room", r.code,
-		"remote", conn.RemoteAddr().String(),
-		"file", meta.Name,
-		"size", meta.Size,
-	)
+		"room", r.code, "remote", conn.RemoteAddr().String(),
+		"plain_size", session.PlainSize, "payload_size", session.PayloadSize,
+		"encrypted_manifest_bytes", len(session.EncryptedManifest), "transfer_id", session.TransferID[:12])
 	go s.roomJanitor(r)
-
 	<-p.done
 }
 
-func (s *Server) handleResumeSend(conn net.Conn, code string, meta *protocol.FileMeta) {
+func (s *Server) handleResumeSend(conn net.Conn, code string, session *protocol.SessionMeta) {
 	if code == "" {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room code required"})
 		return
 	}
-	if err := s.validateMeta(meta); err != nil {
+	if err := s.validateSession(session, false); err != nil {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: err.Error()})
 		return
 	}
-
 	p := newPeerConn(conn)
 	var old *peerConn
 	s.mu.Lock()
@@ -279,9 +274,9 @@ func (s *Server) handleResumeSend(conn net.Conn, code string, meta *protocol.Fil
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeComplete, Room: code})
 		return
 	}
-	if r.meta.Size != meta.Size || r.meta.SHA256 != meta.SHA256 || r.meta.Name != meta.Name {
+	if !sameSessionIdentity(r.session, *session) {
 		s.mu.Unlock()
-		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "resume file does not match original room file"})
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "resume session original room bilan mos emas"})
 		return
 	}
 	old = r.sender
@@ -293,7 +288,7 @@ func (s *Server) handleResumeSend(conn net.Conn, code string, meta *protocol.Fil
 		old.close()
 	}
 	_ = conn.SetDeadline(time.Time{})
-	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: code, File: &r.meta}); err != nil {
+	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: code}); err != nil {
 		p.close()
 		return
 	}
@@ -307,7 +302,6 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room code required"})
 		return
 	}
-
 	p := newPeerConn(conn)
 	var old *peerConn
 	s.mu.Lock()
@@ -335,18 +329,17 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 	r.receiver = p
 	r.receiverReady = false
 	r.expiresAt = time.Now().Add(s.cfg.ResumeGrace)
-	meta := r.meta
+	session := cloneSession(r.session)
 	s.mu.Unlock()
 
 	if old != nil && old != p {
 		old.close()
 	}
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: code, File: &meta}); err != nil {
+	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: code, Session: &session}); err != nil {
 		p.close()
 		return
 	}
-
 	ready, err := protocol.ReadMessage(conn)
 	if err != nil {
 		p.close()
@@ -357,7 +350,7 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 		p.close()
 		return
 	}
-	if ready.Offset < 0 || ready.Offset > meta.Size {
+	if ready.Offset < 0 || ready.Offset > session.PayloadSize {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid resume offset"})
 		p.close()
 		return
@@ -376,9 +369,9 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 
 	_ = conn.SetDeadline(time.Time{})
 	if resume {
-		s.cfg.Logger.Info("receiver resumed", "room", code, "remote", conn.RemoteAddr().String(), "offset", ready.Offset)
+		s.cfg.Logger.Info("receiver resumed", "room", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset)
 	} else {
-		s.cfg.Logger.Info("receiver joined", "room", code, "remote", conn.RemoteAddr().String(), "offset", ready.Offset)
+		s.cfg.Logger.Info("receiver joined", "room", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset)
 	}
 	s.maybeStartRelay(r)
 	<-p.done
@@ -390,25 +383,22 @@ func (s *Server) maybeStartRelay(r *room) {
 		s.mu.Unlock()
 		return
 	}
-	sp := r.sender
-	rp := r.receiver
+	sp, rp := r.sender, r.receiver
 	offset := r.receiverOffset
-	meta := r.meta
+	session := cloneSession(r.session)
 	r.relaying = true
 	r.expiresAt = time.Now().Add(s.cfg.TransferTimeout)
 	s.mu.Unlock()
-
-	go s.relaySession(r, sp, rp, offset, meta)
+	go s.relaySession(r, sp, rp, offset, session)
 }
 
-func (s *Server) relaySession(r *room, sp, rp *peerConn, offset int64, meta protocol.FileMeta) {
+func (s *Server) relaySession(r *room, sp, rp *peerConn, offset int64, session protocol.SessionMeta) {
 	started := time.Now()
-	remaining := meta.Size - offset
+	remaining := session.PayloadSize - offset
 	if remaining < 0 {
 		s.failRoomTerminal(r, "invalid relay offset")
 		return
 	}
-
 	_ = sp.conn.SetDeadline(time.Now().Add(s.cfg.TransferTimeout))
 	_ = rp.conn.SetDeadline(time.Now().Add(s.cfg.TransferTimeout))
 
@@ -422,12 +412,7 @@ func (s *Server) relaySession(r *room, sp, rp *peerConn, offset int64, meta prot
 		return
 	}
 
-	s.cfg.Logger.Info("transfer started",
-		"room", r.code,
-		"offset", offset,
-		"remaining", remaining,
-	)
-
+	s.cfg.Logger.Info("encrypted transfer started", "room", r.code, "cipher_offset", offset, "cipher_remaining", remaining)
 	buf, put := getTransferBuffer()
 	written, err := io.CopyBuffer(rp.conn, io.LimitReader(sp.conn, remaining), *buf)
 	put()
@@ -450,17 +435,15 @@ func (s *Server) relaySession(r *room, sp, rp *peerConn, offset int64, meta prot
 		return
 	}
 	if verified.Type != protocol.TypeVerified {
-		s.failRoomTerminal(r, "receiver did not verify file")
+		s.failRoomTerminal(r, "receiver did not verify transfer")
 		return
 	}
-
 	s.markComplete(r, sp, rp, started)
 }
 
 func (s *Server) recoverRelay(r *room, sp, rp *peerConn, offset, written int64, started time.Time, err error) {
 	sp.close()
 	rp.close()
-
 	s.mu.Lock()
 	if r.completed {
 		s.mu.Unlock()
@@ -478,24 +461,15 @@ func (s *Server) recoverRelay(r *room, sp, rp *peerConn, offset, written int64, 
 	s.mu.Unlock()
 
 	elapsed := time.Since(started)
-	totalDone := offset + written
 	avg := 0.0
 	if elapsed > 0 {
 		avg = float64(written) / elapsed.Seconds()
 	}
-	s.cfg.Logger.Warn("transfer interrupted; resume available",
-		"room", r.code,
-		"bytes_session", written,
-		"bytes_server_observed", totalDone,
-		"file_size", r.meta.Size,
-		"elapsed", elapsed.Round(time.Millisecond),
-		"avg_mib_s", avg/(1024*1024),
-		"resume_grace", s.cfg.ResumeGrace,
-		"error", err,
-	)
-
-	// A replacement peer may already have attached while the old relay was
-	// unwinding. Re-check readiness immediately.
+	s.cfg.Logger.Warn("encrypted transfer interrupted; resume available",
+		"room", r.code, "cipher_bytes_session", written,
+		"cipher_server_observed", offset+written, "payload_size", r.session.PayloadSize,
+		"elapsed", elapsed.Round(time.Millisecond), "avg_mib_s", avg/(1024*1024),
+		"resume_grace", s.cfg.ResumeGrace, "error", err)
 	s.maybeStartRelay(r)
 }
 
@@ -521,20 +495,14 @@ func (s *Server) markComplete(r *room, sp, rp *peerConn, started time.Time) {
 	_ = protocol.WriteMessage(sp.conn, protocol.Message{Type: protocol.TypeComplete, Room: r.code})
 	sp.close()
 	rp.close()
-
-	elapsed := time.Since(started)
-	s.cfg.Logger.Info("transfer complete",
-		"room", r.code,
-		"size", r.meta.Size,
-		"session_elapsed", elapsed.Round(time.Millisecond),
-		"completion_cache", s.cfg.ResumeGrace,
-	)
+	s.cfg.Logger.Info("encrypted transfer complete",
+		"room", r.code, "plain_size", r.session.PlainSize, "payload_size", r.session.PayloadSize,
+		"session_elapsed", time.Since(started).Round(time.Millisecond), "completion_cache", s.cfg.ResumeGrace)
 }
 
 func (s *Server) failRoomTerminal(r *room, reason string) {
 	s.mu.Lock()
-	sp := r.sender
-	rp := r.receiver
+	sp, rp := r.sender, r.receiver
 	s.mu.Unlock()
 	if sp != nil {
 		_ = protocol.WriteMessage(sp.conn, protocol.Message{Type: protocol.TypeError, Room: r.code, Text: reason})
@@ -556,8 +524,7 @@ func (s *Server) roomJanitor(r *room) {
 		case <-ticker.C:
 			s.mu.Lock()
 			current, ok := s.rooms[r.code]
-			expiresAt := r.expiresAt
-			completed := r.completed
+			expiresAt, completed := r.expiresAt, r.completed
 			s.mu.Unlock()
 			if !ok || current != r {
 				return
@@ -580,12 +547,9 @@ func (s *Server) finishRoom(r *room, reason string) {
 		if current, ok := s.rooms[r.code]; ok && current == r {
 			delete(s.rooms, r.code)
 		}
-		sp := r.sender
-		rp := r.receiver
-		r.sender = nil
-		r.receiver = nil
+		sp, rp := r.sender, r.receiver
+		r.sender, r.receiver = nil, nil
 		s.mu.Unlock()
-
 		if sp != nil {
 			sp.close()
 		}
@@ -597,20 +561,40 @@ func (s *Server) finishRoom(r *room, reason string) {
 	})
 }
 
-func (s *Server) validateMeta(meta *protocol.FileMeta) error {
-	if meta == nil {
-		return errors.New("file metadata required")
+func (s *Server) validateSession(session *protocol.SessionMeta, requireManifest bool) error {
+	if session == nil {
+		return errors.New("session metadata required")
 	}
-	if meta.Size < 0 || meta.Size > s.cfg.MaxFileSize {
-		return fmt.Errorf("file size %d exceeds server limit", meta.Size)
+	if len(session.TransferID) != 64 {
+		return errors.New("invalid transfer_id")
 	}
-	if len(meta.Name) == 0 || len(meta.Name) > 255 {
-		return errors.New("invalid file name")
+	if session.PlainSize < 0 || session.PlainSize > s.cfg.MaxTransferSize {
+		return fmt.Errorf("transfer size %d exceeds server limit", session.PlainSize)
 	}
-	if len(meta.SHA256) != 64 {
-		return errors.New("invalid sha256 metadata")
+	if session.PayloadSize < session.PlainSize || session.PayloadSize > s.cfg.MaxTransferSize+(1<<30) {
+		return errors.New("invalid encrypted payload size")
+	}
+	if requireManifest {
+		if len(session.EncryptedManifest) == 0 || len(session.EncryptedManifest) > s.cfg.MaxEncryptedManifest {
+			return errors.New("encrypted manifest missing or too large")
+		}
+		if transferID(session.EncryptedManifest) != session.TransferID {
+			return errors.New("transfer_id does not match encrypted manifest")
+		}
 	}
 	return nil
+}
+
+func sameSessionIdentity(a, b protocol.SessionMeta) bool {
+	return a.TransferID == b.TransferID && a.PlainSize == b.PlainSize && a.PayloadSize == b.PayloadSize
+}
+
+func cloneSession(s protocol.SessionMeta) protocol.SessionMeta {
+	out := s
+	if s.EncryptedManifest != nil {
+		out.EncryptedManifest = append([]byte(nil), s.EncryptedManifest...)
+	}
+	return out
 }
 
 func (s *Server) allowHandshake(addr net.Addr) bool {
@@ -619,9 +603,15 @@ func (s *Server) allowHandshake(addr net.Addr) bool {
 		host = h
 	}
 	now := time.Now()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.rates) > 4096 {
+		for ip, w := range s.rates {
+			if now.Sub(w.start) > 5*time.Minute {
+				delete(s.rates, ip)
+			}
+		}
+	}
 	w := s.rates[host]
 	if w.start.IsZero() || now.Sub(w.start) >= time.Minute {
 		s.rates[host] = rateWindow{start: now, count: 1}
@@ -643,7 +633,6 @@ func (s *Server) Shutdown() error {
 		rooms = append(rooms, r)
 	}
 	s.mu.Unlock()
-
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -657,8 +646,7 @@ func secureRoomCode(n int) (string, error) {
 	if n <= 0 {
 		return "", errors.New("invalid room code length")
 	}
-	buf := make([]byte, n)
-	raw := make([]byte, n)
+	buf, raw := make([]byte, n), make([]byte, n)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}

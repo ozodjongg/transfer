@@ -2,16 +2,17 @@ package transfer
 
 import "testing"
 
-func TestSafeFilename(t *testing.T) {
-	cases := map[string]string{
-		"report.xlsx":     "report.xlsx",
-		"../secret.txt":   "secret.txt",
-		"folder/file.csv": "file.csv",
-		"\x00unsafe.bin":  "unsafe.bin",
+func TestHumanDuration(t *testing.T) {
+	if got := HumanDuration(3); got != "00:00" { // 3ns rounds down
+		t.Fatalf("got %q", got)
 	}
-	for in, want := range cases {
-		if got := SafeFilename(in); got != want {
-			t.Fatalf("SafeFilename(%q)=%q, want %q", in, got, want)
+}
+
+func TestValidateManifestPathRejectsTraversal(t *testing.T) {
+	bad := []string{"../secret", "a/../../b", "/absolute", "a\\b", ""}
+	for _, p := range bad {
+		if err := validateManifestPath(p); err == nil {
+			t.Fatalf("expected unsafe path rejection for %q", p)
 		}
 	}
 }

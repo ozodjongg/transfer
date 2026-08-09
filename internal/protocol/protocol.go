@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	Version      = 2
-	MaxFrameSize = 64 * 1024
+	Version      = 5
+	MaxFrameSize = 4 * 1024 * 1024
 
 	TypeCreate        = "create"
 	TypeJoin          = "join"
@@ -26,18 +26,21 @@ const (
 )
 
 type Message struct {
-	Version int       `json:"version"`
-	Type    string    `json:"type"`
-	Room    string    `json:"room,omitempty"`
-	Text    string    `json:"text,omitempty"`
-	Offset  int64     `json:"offset,omitempty"`
-	File    *FileMeta `json:"file,omitempty"`
+	Version int          `json:"version"`
+	Type    string       `json:"type"`
+	Room    string       `json:"room,omitempty"`
+	Text    string       `json:"text,omitempty"`
+	Offset  int64        `json:"offset,omitempty"` // encrypted payload byte offset
+	Session *SessionMeta `json:"session,omitempty"`
 }
 
-type FileMeta struct {
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+// SessionMeta intentionally contains no filenames, folder names or plaintext
+// hashes. Manifest is already end-to-end encrypted by the sender.
+type SessionMeta struct {
+	TransferID        string `json:"transfer_id"`
+	PlainSize         int64  `json:"plain_size"`
+	PayloadSize       int64  `json:"payload_size"`
+	EncryptedManifest []byte `json:"encrypted_manifest,omitempty"`
 }
 
 func WriteMessage(w io.Writer, msg Message) error {
