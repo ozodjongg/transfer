@@ -9,16 +9,20 @@ import (
 )
 
 const (
-	Version       = 1
-	MaxFrameSize  = 64 * 1024
-	TypeCreate    = "create"
-	TypeJoin      = "join"
-	TypeCreated   = "created"
-	TypeJoined    = "joined"
-	TypePeerReady = "peer_ready"
-	TypeFileMeta  = "file_meta"
-	TypeComplete  = "complete"
-	TypeError     = "error"
+	Version      = 2
+	MaxFrameSize = 64 * 1024
+
+	TypeCreate        = "create"
+	TypeJoin          = "join"
+	TypeResumeSend    = "resume_send"
+	TypeResumeReceive = "resume_receive"
+	TypeCreated       = "created"
+	TypeJoined        = "joined"
+	TypeReceiverReady = "receiver_ready"
+	TypePeerReady     = "peer_ready"
+	TypeVerified      = "verified"
+	TypeComplete      = "complete"
+	TypeError         = "error"
 )
 
 type Message struct {
@@ -26,6 +30,7 @@ type Message struct {
 	Type    string    `json:"type"`
 	Room    string    `json:"room,omitempty"`
 	Text    string    `json:"text,omitempty"`
+	Offset  int64     `json:"offset,omitempty"`
 	File    *FileMeta `json:"file,omitempty"`
 }
 

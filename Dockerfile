@@ -36,4 +36,4 @@ USER app
 EXPOSE 8080
 
 ENTRYPOINT ["/app/transfer-server"]
-CMD ["-addr", ":8080", "-max-file-gb", "10", "-room-ttl", "10m", "-transfer-timeout", "2h", "-max-connections", "512", "-max-handshakes-per-minute", "120"]
+CMD ["-addr", ":8080", "-max-file-gb", "10", "-room-ttl", "10m", "-transfer-timeout", "2h", "-resume-grace", "2m", "-max-connections", "512", "-max-handshakes-per-minute", "120"]

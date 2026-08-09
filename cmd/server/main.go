@@ -21,6 +21,7 @@ func main() {
 	maxFileGB := flag.Int64("max-file-gb", 10, "maximum file size in GiB")
 	roomTTL := flag.Duration("room-ttl", 10*time.Minute, "room waiting lifetime")
 	transferTimeout := flag.Duration("transfer-timeout", 2*time.Hour, "maximum transfer duration")
+	resumeGrace := flag.Duration("resume-grace", 2*time.Minute, "how long a broken room remains resumable")
 	maxConnections := flag.Int("max-connections", 512, "maximum simultaneous TCP connections")
 	maxHandshakes := flag.Int("max-handshakes-per-minute", 120, "maximum new handshakes per IP per minute")
 	certFile := flag.String("tls-cert", "", "TLS certificate PEM file")
@@ -46,6 +47,7 @@ func main() {
 		Addr:                   *addr,
 		RoomTTL:                *roomTTL,
 		TransferTimeout:        *transferTimeout,
+		ResumeGrace:            *resumeGrace,
 		MaxFileSize:            *maxFileGB << 30,
 		MaxConnections:         *maxConnections,
 		MaxHandshakesPerMinute: *maxHandshakes,
