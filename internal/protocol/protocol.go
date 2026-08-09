@@ -9,13 +9,17 @@ import (
 )
 
 const (
-	Version      = 5
+	Version      = 6
 	MaxFrameSize = 4 * 1024 * 1024
 
 	TypeCreate        = "create"
 	TypeJoin          = "join"
 	TypeResumeSend    = "resume_send"
 	TypeResumeReceive = "resume_receive"
+	TypeCancel        = "cancel"
+	TypeDataSend      = "data_send"
+	TypeDataReceive   = "data_receive"
+
 	TypeCreated       = "created"
 	TypeJoined        = "joined"
 	TypeReceiverReady = "receiver_ready"
@@ -30,17 +34,27 @@ type Message struct {
 	Type    string       `json:"type"`
 	Room    string       `json:"room,omitempty"`
 	Text    string       `json:"text,omitempty"`
-	Offset  int64        `json:"offset,omitempty"` // encrypted payload byte offset
+	Offset  int64        `json:"offset,omitempty"`  // single-stream encrypted payload offset
+	Offsets []int64      `json:"offsets,omitempty"` // per-stream encrypted payload offsets
+	Proof   string       `json:"proof,omitempty"`
+	Token   string       `json:"token,omitempty"`
+	Stream  int          `json:"stream,omitempty"`
 	Session *SessionMeta `json:"session,omitempty"`
 }
 
 // SessionMeta intentionally contains no filenames, folder names or plaintext
 // hashes. Manifest is already end-to-end encrypted by the sender.
+// ResumeRooms are opaque HMAC-derived aliases; knowing them does not reveal the
+// transfer secret or manifest.
 type SessionMeta struct {
-	TransferID        string `json:"transfer_id"`
-	PlainSize         int64  `json:"plain_size"`
-	PayloadSize       int64  `json:"payload_size"`
-	EncryptedManifest []byte `json:"encrypted_manifest,omitempty"`
+	TransferID         string   `json:"transfer_id"`
+	PlainSize          int64    `json:"plain_size"`
+	PayloadSize        int64    `json:"payload_size"`
+	EncryptedManifest  []byte   `json:"encrypted_manifest,omitempty"`
+	ResumeRooms        []string `json:"resume_rooms,omitempty"`
+	StreamCount        int      `json:"stream_count,omitempty"`
+	StreamPayloadSizes []int64  `json:"stream_payload_sizes,omitempty"`
+	AttachToken        string   `json:"attach_token,omitempty"`
 }
 
 func WriteMessage(w io.Writer, msg Message) error {

@@ -52,16 +52,23 @@ func (p *peerConn) close() {
 
 type room struct {
 	code      string
+	aliases   []string
 	session   protocol.SessionMeta
 	createdAt time.Time
 	expiresAt time.Time
 
-	sender         *peerConn
-	receiver       *peerConn
-	receiverOffset int64
-	receiverReady  bool
-	relaying       bool
-	completed      bool
+	sender          *peerConn
+	receiver        *peerConn
+	receiverOffset  int64
+	receiverOffsets []int64
+	receiverReady   bool
+	relaying        bool
+	completed       bool
+	verified        bool
+
+	senderData   map[int]*peerConn
+	receiverData map[int]*peerConn
+	streamDone   []bool
 
 	done       chan struct{}
 	finishOnce sync.Once
@@ -76,6 +83,7 @@ type Server struct {
 	cfg      ServerConfig
 	mu       sync.Mutex
 	rooms    map[string]*room
+	aliases  map[string]*room
 	rates    map[string]rateWindow
 	sem      chan struct{}
 	listener net.Listener
@@ -113,7 +121,7 @@ func NewServer(cfg ServerConfig) *Server {
 		cfg.Logger = slog.Default()
 	}
 	return &Server{
-		cfg: cfg, rooms: make(map[string]*room), rates: make(map[string]rateWindow),
+		cfg: cfg, rooms: make(map[string]*room), aliases: make(map[string]*room), rates: make(map[string]rateWindow),
 		sem: make(chan struct{}, cfg.MaxConnections),
 	}
 }
@@ -203,6 +211,12 @@ func (s *Server) handle(conn net.Conn) {
 		s.handleReceiver(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), false)
 	case protocol.TypeResumeReceive:
 		s.handleReceiver(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), true)
+	case protocol.TypeDataSend:
+		s.handleData(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Stream, msg.Token, true)
+	case protocol.TypeDataReceive:
+		s.handleData(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Stream, msg.Token, false)
+	case protocol.TypeCancel:
+		s.handleCancel(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Token)
 	default:
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "unknown command"})
 	}
@@ -215,13 +229,25 @@ func (s *Server) handleCreate(conn net.Conn, session *protocol.SessionMeta) {
 	}
 	p := newPeerConn(conn)
 	now := time.Now()
-	r := &room{session: cloneSession(*session), createdAt: now, expiresAt: now.Add(s.cfg.RoomTTL), sender: p, done: make(chan struct{})}
+	r := &room{session: cloneSession(*session), aliases: append([]string(nil), session.ResumeRooms...), createdAt: now, expiresAt: now.Add(s.cfg.RoomTTL), sender: p, done: make(chan struct{}), senderData: make(map[int]*peerConn), receiverData: make(map[int]*peerConn), streamDone: make([]bool, session.StreamCount)}
 
 	s.mu.Lock()
 	if len(s.rooms) >= s.cfg.MaxRooms {
 		s.mu.Unlock()
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "server room capacity reached"})
 		return
+	}
+	for _, alias := range r.aliases {
+		if _, exists := s.rooms[alias]; exists {
+			s.mu.Unlock()
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "resume alias collision; retry transfer"})
+			return
+		}
+		if _, exists := s.aliases[alias]; exists {
+			s.mu.Unlock()
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "resume alias collision; retry transfer"})
+			return
+		}
 	}
 	for {
 		code, err := secureRoomCode(10)
@@ -231,8 +257,14 @@ func (s *Server) handleCreate(conn net.Conn, session *protocol.SessionMeta) {
 			return
 		}
 		if _, exists := s.rooms[code]; !exists {
+			if _, aliasExists := s.aliases[code]; aliasExists {
+				continue
+			}
 			r.code = code
 			s.rooms[code] = r
+			for _, alias := range r.aliases {
+				s.aliases[alias] = r
+			}
 			break
 		}
 	}
@@ -263,7 +295,7 @@ func (s *Server) handleResumeSend(conn net.Conn, code string, session *protocol.
 	p := newPeerConn(conn)
 	var old *peerConn
 	s.mu.Lock()
-	r, ok := s.rooms[code]
+	r, ok := s.lookupRoomLocked(code)
 	if !ok {
 		s.mu.Unlock()
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room not found or resume window expired"})
@@ -305,7 +337,7 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 	p := newPeerConn(conn)
 	var old *peerConn
 	s.mu.Lock()
-	r, ok := s.rooms[code]
+	r, ok := s.lookupRoomLocked(code)
 	if !ok {
 		s.mu.Unlock()
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room not found or resume window expired"})
@@ -330,6 +362,10 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 	r.receiverReady = false
 	r.expiresAt = time.Now().Add(s.cfg.ResumeGrace)
 	session := cloneSession(r.session)
+	// Receiver derives routing credentials from the E2E secret; do not expose
+	// resume aliases or the data attach token in relay responses.
+	session.ResumeRooms = nil
+	session.AttachToken = ""
 	s.mu.Unlock()
 
 	if old != nil && old != p {
@@ -350,28 +386,54 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 		p.close()
 		return
 	}
-	if ready.Offset < 0 || ready.Offset > session.PayloadSize {
-		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid resume offset"})
-		p.close()
-		return
+	var offsets []int64
+	if session.StreamCount > 1 {
+		if len(ready.Offsets) != session.StreamCount {
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid stream resume offsets"})
+			p.close()
+			return
+		}
+		offsets = append([]int64(nil), ready.Offsets...)
+		for i, off := range offsets {
+			if off < 0 || off > session.StreamPayloadSizes[i] {
+				_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid stream resume offset"})
+				p.close()
+				return
+			}
+		}
+	} else {
+		if ready.Offset < 0 || ready.Offset > session.PayloadSize {
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid resume offset"})
+			p.close()
+			return
+		}
+		offsets = []int64{ready.Offset}
 	}
 
 	s.mu.Lock()
-	if current, exists := s.rooms[code]; !exists || current != r || r.receiver != p || r.completed {
+	if current, exists := s.lookupRoomLocked(code); !exists || current != r || r.receiver != p || r.completed {
 		s.mu.Unlock()
 		p.close()
 		return
 	}
 	r.receiverOffset = ready.Offset
+	r.receiverOffsets = offsets
 	r.receiverReady = true
+	r.verified = false
+	if len(r.streamDone) != session.StreamCount {
+		r.streamDone = make([]bool, session.StreamCount)
+	}
+	for i := range r.streamDone {
+		r.streamDone[i] = i < len(offsets) && offsets[i] == session.StreamPayloadSizes[i]
+	}
 	r.expiresAt = time.Now().Add(s.cfg.TransferTimeout)
 	s.mu.Unlock()
 
 	_ = conn.SetDeadline(time.Time{})
 	if resume {
-		s.cfg.Logger.Info("receiver resumed", "room", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset)
+		s.cfg.Logger.Info("receiver resumed", "room", r.code, "via", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset, "stream_offsets", offsets)
 	} else {
-		s.cfg.Logger.Info("receiver joined", "room", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset)
+		s.cfg.Logger.Info("receiver joined", "room", r.code, "via", code, "remote", conn.RemoteAddr().String(), "cipher_offset", ready.Offset, "stream_offsets", offsets)
 	}
 	s.maybeStartRelay(r)
 	<-p.done
@@ -385,11 +447,225 @@ func (s *Server) maybeStartRelay(r *room) {
 	}
 	sp, rp := r.sender, r.receiver
 	offset := r.receiverOffset
+	offsets := append([]int64(nil), r.receiverOffsets...)
 	session := cloneSession(r.session)
 	r.relaying = true
 	r.expiresAt = time.Now().Add(s.cfg.TransferTimeout)
 	s.mu.Unlock()
+
+	if session.StreamCount > 1 {
+		ready := protocol.Message{Type: protocol.TypePeerReady, Room: r.code, Offsets: offsets}
+		if err := protocol.WriteMessage(sp.conn, ready); err != nil {
+			s.recoverMultiRelay(r, fmt.Errorf("notify sender: %w", err))
+			return
+		}
+		if err := protocol.WriteMessage(rp.conn, ready); err != nil {
+			s.recoverMultiRelay(r, fmt.Errorf("notify receiver: %w", err))
+			return
+		}
+		s.cfg.Logger.Info("parallel encrypted transfer ready", "room", r.code, "streams", session.StreamCount, "stream_offsets", offsets)
+		go s.waitMultiVerification(r, rp)
+		for i := 0; i < session.StreamCount; i++ {
+			s.maybeStartDataRelay(r, i)
+		}
+		return
+	}
 	go s.relaySession(r, sp, rp, offset, session)
+}
+
+func (s *Server) handleCancel(conn net.Conn, code, token string) {
+	s.mu.Lock()
+	r, ok := s.lookupRoomLocked(code)
+	if !ok {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeComplete, Room: code})
+		return
+	}
+	if token == "" || token != r.session.AttachToken {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid cancel token"})
+		return
+	}
+	s.mu.Unlock()
+	_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeComplete, Room: r.code})
+	s.finishRoom(r, "sender selected LAN direct transport")
+}
+
+func (s *Server) handleData(conn net.Conn, code string, stream int, token string, sender bool) {
+	p := newPeerConn(conn)
+	s.mu.Lock()
+	r, ok := s.lookupRoomLocked(code)
+	if !ok || r.completed {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room not found or completed"})
+		return
+	}
+	if r.session.StreamCount <= 1 || stream < 0 || stream >= r.session.StreamCount {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid data stream"})
+		return
+	}
+	if token == "" || token != r.session.AttachToken {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid data attach token"})
+		return
+	}
+	var old *peerConn
+	if sender {
+		old = r.senderData[stream]
+		r.senderData[stream] = p
+	} else {
+		old = r.receiverData[stream]
+		r.receiverData[stream] = p
+	}
+	r.expiresAt = time.Now().Add(s.cfg.TransferTimeout)
+	s.mu.Unlock()
+	if old != nil && old != p {
+		old.close()
+	}
+	_ = conn.SetDeadline(time.Time{})
+	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: r.code, Stream: stream}); err != nil {
+		p.close()
+		return
+	}
+	s.maybeStartDataRelay(r, stream)
+	<-p.done
+}
+
+func (s *Server) maybeStartDataRelay(r *room, stream int) {
+	s.mu.Lock()
+	if r.completed || !r.relaying || r.session.StreamCount <= 1 || stream < 0 || stream >= r.session.StreamCount || r.streamDone[stream] {
+		s.mu.Unlock()
+		return
+	}
+	sp := r.senderData[stream]
+	rp := r.receiverData[stream]
+	if sp == nil || rp == nil {
+		s.mu.Unlock()
+		return
+	}
+	offset := int64(0)
+	if stream < len(r.receiverOffsets) {
+		offset = r.receiverOffsets[stream]
+	}
+	remaining := r.session.StreamPayloadSizes[stream] - offset
+	if remaining < 0 {
+		s.mu.Unlock()
+		s.recoverMultiRelay(r, errors.New("negative data stream remaining size"))
+		return
+	}
+	// Remove from maps while active so duplicate attaches replace only future
+	// sessions, not a currently relaying stream.
+	delete(r.senderData, stream)
+	delete(r.receiverData, stream)
+	s.mu.Unlock()
+	go s.relayDataStream(r, stream, sp, rp, offset, remaining)
+}
+
+func (s *Server) relayDataStream(r *room, stream int, sp, rp *peerConn, offset, remaining int64) {
+	started := time.Now()
+	_ = sp.conn.SetDeadline(time.Now().Add(s.cfg.TransferTimeout))
+	_ = rp.conn.SetDeadline(time.Now().Add(s.cfg.TransferTimeout))
+	buf, put := getTransferBuffer()
+	written, err := io.CopyBuffer(rp.conn, io.LimitReader(sp.conn, remaining), *buf)
+	put()
+	if err != nil || written != remaining {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		sp.close()
+		rp.close()
+		s.recoverMultiRelay(r, fmt.Errorf("stream %d interrupted after %d/%d: %w", stream, written, remaining, err))
+		return
+	}
+	sp.close()
+	rp.close()
+	s.mu.Lock()
+	if !r.completed && r.relaying && stream < len(r.streamDone) {
+		r.streamDone[stream] = true
+	}
+	s.mu.Unlock()
+	s.cfg.Logger.Info("parallel data stream complete", "room", r.code, "stream", stream, "bytes", written, "elapsed", time.Since(started).Round(time.Millisecond))
+	s.maybeCompleteMulti(r)
+}
+
+func (s *Server) waitMultiVerification(r *room, rp *peerConn) {
+	msg, err := protocol.ReadMessage(rp.conn)
+	if err != nil {
+		s.recoverMultiRelay(r, fmt.Errorf("parallel receiver verification: %w", err))
+		return
+	}
+	if msg.Type == protocol.TypeError {
+		s.failRoomTerminal(r, "receiver verification failed: "+msg.Text)
+		return
+	}
+	if msg.Type != protocol.TypeVerified {
+		s.recoverMultiRelay(r, errors.New("parallel receiver did not verify transfer"))
+		return
+	}
+	s.mu.Lock()
+	if !r.completed && r.receiver == rp {
+		r.verified = true
+	}
+	s.mu.Unlock()
+	s.maybeCompleteMulti(r)
+}
+
+func (s *Server) maybeCompleteMulti(r *room) {
+	s.mu.Lock()
+	if r.completed || !r.relaying || !r.verified {
+		s.mu.Unlock()
+		return
+	}
+	for _, done := range r.streamDone {
+		if !done {
+			s.mu.Unlock()
+			return
+		}
+	}
+	sp, rp := r.sender, r.receiver
+	s.mu.Unlock()
+	if sp == nil || rp == nil {
+		return
+	}
+	s.markComplete(r, sp, rp, time.Now())
+}
+
+func (s *Server) recoverMultiRelay(r *room, err error) {
+	s.mu.Lock()
+	if r.completed || !r.relaying {
+		s.mu.Unlock()
+		return
+	}
+	r.relaying = false
+	r.receiverReady = false
+	r.verified = false
+	sp, rp := r.sender, r.receiver
+	r.sender, r.receiver = nil, nil
+	data := make([]*peerConn, 0, len(r.senderData)+len(r.receiverData))
+	for _, p := range r.senderData {
+		data = append(data, p)
+	}
+	for _, p := range r.receiverData {
+		data = append(data, p)
+	}
+	r.senderData = make(map[int]*peerConn)
+	r.receiverData = make(map[int]*peerConn)
+	for i := range r.streamDone {
+		r.streamDone[i] = false
+	}
+	r.expiresAt = time.Now().Add(s.cfg.ResumeGrace)
+	s.mu.Unlock()
+	if sp != nil {
+		sp.close()
+	}
+	if rp != nil {
+		rp.close()
+	}
+	for _, p := range data {
+		p.close()
+	}
+	s.cfg.Logger.Warn("parallel transfer interrupted; resume available", "room", r.code, "resume_grace", s.cfg.ResumeGrace, "error", err)
 }
 
 func (s *Server) relaySession(r *room, sp, rp *peerConn, offset int64, session protocol.SessionMeta) {
@@ -547,14 +823,31 @@ func (s *Server) finishRoom(r *room, reason string) {
 		if current, ok := s.rooms[r.code]; ok && current == r {
 			delete(s.rooms, r.code)
 		}
+		for _, alias := range r.aliases {
+			if current, ok := s.aliases[alias]; ok && current == r {
+				delete(s.aliases, alias)
+			}
+		}
 		sp, rp := r.sender, r.receiver
+		data := make([]*peerConn, 0, len(r.senderData)+len(r.receiverData))
+		for _, p := range r.senderData {
+			data = append(data, p)
+		}
+		for _, p := range r.receiverData {
+			data = append(data, p)
+		}
 		r.sender, r.receiver = nil, nil
+		r.senderData = make(map[int]*peerConn)
+		r.receiverData = make(map[int]*peerConn)
 		s.mu.Unlock()
 		if sp != nil {
 			sp.close()
 		}
 		if rp != nil {
 			rp.close()
+		}
+		for _, p := range data {
+			p.close()
 		}
 		close(r.done)
 		s.cfg.Logger.Info("room closed", "room", r.code, "reason", reason)
@@ -574,6 +867,38 @@ func (s *Server) validateSession(session *protocol.SessionMeta, requireManifest 
 	if session.PayloadSize < session.PlainSize || session.PayloadSize > s.cfg.MaxTransferSize+(1<<30) {
 		return errors.New("invalid encrypted payload size")
 	}
+	if session.StreamCount < 1 || session.StreamCount > maxParallelStreams {
+		return errors.New("invalid stream_count")
+	}
+	if len(session.StreamPayloadSizes) != session.StreamCount {
+		return errors.New("stream payload size count mismatch")
+	}
+	var streamTotal int64
+	for _, n := range session.StreamPayloadSizes {
+		if n < 0 {
+			return errors.New("negative stream payload size")
+		}
+		streamTotal += n
+	}
+	if streamTotal != session.PayloadSize {
+		return errors.New("stream payload sizes do not sum to payload_size")
+	}
+	if len(session.AttachToken) < 24 || len(session.AttachToken) > 128 {
+		return errors.New("invalid attach token")
+	}
+	if len(session.ResumeRooms) > 16 {
+		return errors.New("too many resume aliases")
+	}
+	seenAliases := make(map[string]struct{}, len(session.ResumeRooms))
+	for _, alias := range session.ResumeRooms {
+		if !validResumeAlias(alias) {
+			return errors.New("invalid resume alias")
+		}
+		if _, exists := seenAliases[alias]; exists {
+			return errors.New("duplicate resume alias")
+		}
+		seenAliases[alias] = struct{}{}
+	}
 	if requireManifest {
 		if len(session.EncryptedManifest) == 0 || len(session.EncryptedManifest) > s.cfg.MaxEncryptedManifest {
 			return errors.New("encrypted manifest missing or too large")
@@ -586,7 +911,18 @@ func (s *Server) validateSession(session *protocol.SessionMeta, requireManifest 
 }
 
 func sameSessionIdentity(a, b protocol.SessionMeta) bool {
-	return a.TransferID == b.TransferID && a.PlainSize == b.PlainSize && a.PayloadSize == b.PayloadSize
+	if a.TransferID != b.TransferID || a.PlainSize != b.PlainSize || a.PayloadSize != b.PayloadSize || a.StreamCount != b.StreamCount || a.AttachToken != b.AttachToken {
+		return false
+	}
+	if len(a.StreamPayloadSizes) != len(b.StreamPayloadSizes) {
+		return false
+	}
+	for i := range a.StreamPayloadSizes {
+		if a.StreamPayloadSizes[i] != b.StreamPayloadSizes[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneSession(s protocol.SessionMeta) protocol.SessionMeta {
@@ -594,7 +930,33 @@ func cloneSession(s protocol.SessionMeta) protocol.SessionMeta {
 	if s.EncryptedManifest != nil {
 		out.EncryptedManifest = append([]byte(nil), s.EncryptedManifest...)
 	}
+	if s.ResumeRooms != nil {
+		out.ResumeRooms = append([]string(nil), s.ResumeRooms...)
+	}
+	if s.StreamPayloadSizes != nil {
+		out.StreamPayloadSizes = append([]int64(nil), s.StreamPayloadSizes...)
+	}
 	return out
+}
+
+func validResumeAlias(alias string) bool {
+	if len(alias) != 16 {
+		return false
+	}
+	for _, r := range alias {
+		if (r < 'A' || r > 'Z') && (r < '2' || r > '7') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) lookupRoomLocked(code string) (*room, bool) {
+	if r, ok := s.rooms[code]; ok {
+		return r, true
+	}
+	r, ok := s.aliases[code]
+	return r, ok
 }
 
 func (s *Server) allowHandshake(addr net.Addr) bool {

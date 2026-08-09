@@ -218,3 +218,229 @@ func (p *dropOnceProxy) handle(client net.Conn) {
 	}
 	<-done
 }
+
+func TestV6ParallelPublicTransferWithDataStreamResume(t *testing.T) {
+	serverAddr := freeTCPAddr(t)
+	server := NewServer(ServerConfig{
+		Addr: serverAddr, RoomTTL: 10 * time.Second, TransferTimeout: 30 * time.Second,
+		ResumeGrace: 10 * time.Second, MaxTransferSize: 128 << 20, MaxEncryptedManifest: 2 << 20,
+		MaxConnections: 64, MaxHandshakesPerMinute: 5000,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	go server.ListenAndServe()
+	defer server.Shutdown()
+	waitForTCP(t, serverAddr)
+
+	proxy := newDropDataOnceProxy(t, serverAddr, 700*1024)
+	defer proxy.Close()
+
+	src := t.TempDir()
+	folder := filepath.Join(src, "Parallel")
+	if err := os.MkdirAll(filepath.Join(folder, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data1 := bytes.Repeat([]byte("parallel-A-"), 500000) // ~5 MiB
+	data2 := bytes.Repeat([]byte("parallel-B-"), 450000)
+	if err := os.WriteFile(filepath.Join(folder, "a.bin"), data1, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "nested", "b.bin"), data2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	recvDir := t.TempDir()
+	codeCh := make(chan string, 1)
+	baseCfg := ClientConfig{Addr: proxy.Addr(), ConnectTimeout: 2 * time.Second, IOTimeout: 30 * time.Second, LANDirect: false, ParallelStreams: 4}
+	sendCfg := baseCfg
+	sendCfg.OnTransferCode = func(code string) {
+		select {
+		case codeCh <- code:
+		default:
+		}
+	}
+
+	sendErr := make(chan error, 1)
+	go func() { _, err := SendPaths(sendCfg, []string{folder}); sendErr <- err }()
+	var code string
+	select {
+	case code = <-codeCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no code")
+	}
+	recvErr := make(chan error, 1)
+	go func() { _, err := ReceiveTransfer(baseCfg, code, recvDir); recvErr <- err }()
+
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatalf("sender: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("sender timeout")
+	}
+	select {
+	case err := <-recvErr:
+		if err != nil {
+			t.Fatalf("receiver: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("receiver timeout")
+	}
+
+	got1, err := os.ReadFile(filepath.Join(recvDir, "Parallel", "a.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := os.ReadFile(filepath.Join(recvDir, "Parallel", "nested", "b.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got1, data1) || !bytes.Equal(got2, data2) {
+		t.Fatal("parallel output mismatch")
+	}
+	if !proxy.dropped.Load() {
+		t.Fatal("proxy did not drop a data stream")
+	}
+	if proxy.dataSends.Load() < 4 {
+		t.Fatalf("expected parallel data streams, got %d", proxy.dataSends.Load())
+	}
+}
+
+func TestV6LANDirectBypassesPublicPayload(t *testing.T) {
+	serverAddr := freeTCPAddr(t)
+	server := NewServer(ServerConfig{
+		Addr: serverAddr, RoomTTL: 10 * time.Second, TransferTimeout: 30 * time.Second,
+		ResumeGrace: 10 * time.Second, MaxTransferSize: 64 << 20, MaxEncryptedManifest: 2 << 20,
+		MaxConnections: 64, MaxHandshakesPerMinute: 5000,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	go server.ListenAndServe()
+	defer server.Shutdown()
+	waitForTCP(t, serverAddr)
+
+	proxy := newDropDataOnceProxy(t, serverAddr, 1)
+	defer proxy.Close()
+
+	src := t.TempDir()
+	file := filepath.Join(src, "lan.bin")
+	data := bytes.Repeat([]byte("LAN-DIRECT-"), 250000)
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recvDir := t.TempDir()
+	codeCh := make(chan string, 1)
+	sendCfg := ClientConfig{Addr: proxy.Addr(), ConnectTimeout: 2 * time.Second, IOTimeout: 30 * time.Second, LANDirect: true, ParallelStreams: 4, OnTransferCode: func(code string) {
+		select {
+		case codeCh <- code:
+		default:
+		}
+	}}
+	recvCfg := ClientConfig{Addr: proxy.Addr(), ConnectTimeout: 2 * time.Second, IOTimeout: 30 * time.Second, LANDirect: true, ParallelStreams: 4}
+
+	sendErr := make(chan error, 1)
+	go func() { _, err := SendPaths(sendCfg, []string{file}); sendErr <- err }()
+	var code string
+	select {
+	case code = <-codeCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no code")
+	}
+	recvErr := make(chan error, 1)
+	go func() { _, err := ReceiveTransfer(recvCfg, code, recvDir); recvErr <- err }()
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatalf("sender: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("sender timeout")
+	}
+	select {
+	case err := <-recvErr:
+		if err != nil {
+			t.Fatalf("receiver: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("receiver timeout")
+	}
+	got, err := os.ReadFile(filepath.Join(recvDir, "lan.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("LAN output mismatch")
+	}
+	if n := proxy.dataSends.Load(); n != 0 {
+		t.Fatalf("LAN direct unexpectedly used public payload streams: %d", n)
+	}
+}
+
+type dropDataOnceProxy struct {
+	ln        net.Listener
+	target    string
+	dropAfter int64
+	dropped   atomic.Bool
+	dataSends atomic.Int32
+	wg        sync.WaitGroup
+}
+
+func newDropDataOnceProxy(t *testing.T, target string, dropAfter int64) *dropDataOnceProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &dropDataOnceProxy{ln: ln, target: target, dropAfter: dropAfter}
+	p.wg.Add(1)
+	go p.acceptLoop()
+	return p
+}
+func (p *dropDataOnceProxy) Addr() string { return p.ln.Addr().String() }
+func (p *dropDataOnceProxy) Close()       { _ = p.ln.Close(); p.wg.Wait() }
+func (p *dropDataOnceProxy) acceptLoop() {
+	defer p.wg.Done()
+	for {
+		c, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		p.wg.Add(1)
+		go func() { defer p.wg.Done(); p.handle(c) }()
+	}
+}
+func (p *dropDataOnceProxy) handle(client net.Conn) {
+	upstream, err := net.Dial("tcp", p.target)
+	if err != nil {
+		_ = client.Close()
+		return
+	}
+	defer client.Close()
+	defer upstream.Close()
+	first, err := protocol.ReadMessage(client)
+	if err != nil {
+		return
+	}
+	if err := protocol.WriteMessage(upstream, first); err != nil {
+		return
+	}
+	dropThis := false
+	if first.Type == protocol.TypeDataSend {
+		p.dataSends.Add(1)
+		dropThis = p.dropped.CompareAndSwap(false, true)
+	}
+	var once sync.Once
+	done := make(chan struct{})
+	closeBoth := func() { once.Do(func() { _ = client.Close(); _ = upstream.Close(); close(done) }) }
+	go func() { _, _ = io.Copy(client, upstream); closeBoth() }()
+	if dropThis {
+		// Preserve the server's data-stream acknowledgement first. Client payload
+		// begins only after it receives that acknowledgement.
+		time.Sleep(20 * time.Millisecond)
+		_, _ = io.CopyN(upstream, client, p.dropAfter)
+		closeBoth()
+	} else {
+		_, _ = io.Copy(upstream, client)
+		closeBoth()
+	}
+	<-done
+}

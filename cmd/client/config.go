@@ -21,6 +21,12 @@ type AppConfig struct {
 	DownloadDir string        `json:"download_dir"`
 	TLS         TLSConfig     `json:"tls"`
 	Timeouts    TimeoutConfig `json:"timeouts"`
+	Network     NetworkConfig `json:"network"`
+}
+
+type NetworkConfig struct {
+	LANDirect       bool `json:"lan_direct"`
+	ParallelStreams int  `json:"parallel_streams"`
 }
 
 type TLSConfig struct {
@@ -45,6 +51,7 @@ func defaultAppConfig() AppConfig {
 			Connect: "10s",
 			IO:      "2h",
 		},
+		Network: NetworkConfig{LANDirect: true, ParallelStreams: 4},
 	}
 }
 
@@ -160,6 +167,9 @@ func (c AppConfig) validate() error {
 	if c.TLS.InsecureSkipVerify && !c.TLS.Enabled {
 		return errors.New("config: tls.insecure_skip_verify faqat tls.enabled=true bo'lganda ishlatiladi")
 	}
+	if c.Network.ParallelStreams < 1 || c.Network.ParallelStreams > 8 {
+		return errors.New("config: network.parallel_streams 1..8 oralig'ida bo'lishi kerak")
+	}
 	return nil
 }
 
@@ -202,9 +212,11 @@ func (c AppConfig) transferConfig() (transfer.ClientConfig, error) {
 	}
 
 	return transfer.ClientConfig{
-		Addr:           c.Server,
-		TLSConfig:      tlsConfig,
-		ConnectTimeout: connectTimeout,
-		IOTimeout:      ioTimeout,
+		Addr:            c.Server,
+		TLSConfig:       tlsConfig,
+		ConnectTimeout:  connectTimeout,
+		IOTimeout:       ioTimeout,
+		LANDirect:       c.Network.LANDirect,
+		ParallelStreams: c.Network.ParallelStreams,
 	}, nil
 }

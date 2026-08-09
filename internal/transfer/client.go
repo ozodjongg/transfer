@@ -23,10 +23,12 @@ const (
 )
 
 type ClientConfig struct {
-	Addr           string
-	TLSConfig      *tls.Config
-	ConnectTimeout time.Duration
-	IOTimeout      time.Duration
+	Addr            string
+	TLSConfig       *tls.Config
+	ConnectTimeout  time.Duration
+	IOTimeout       time.Duration
+	LANDirect       bool
+	ParallelStreams int
 
 	OnRoomCreated  func(string)
 	OnTransferCode func(string)
@@ -92,13 +94,54 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	resumeRooms := deriveResumeRooms(secret, maxResumeAttempts)
+	streamCount := cfg.ParallelStreams
+	if streamCount < 1 {
+		streamCount = 1
+	}
+	if streamCount > maxParallelStreams {
+		streamCount = maxParallelStreams
+	}
+	ranges := splitPlanRanges(plans, streamCount)
+	attachToken := deriveAttachToken(secret)
 	session := protocol.SessionMeta{
 		TransferID: transferID(encryptedManifest), PlainSize: manifest.TotalSize,
-		PayloadSize: payloadSize, EncryptedManifest: encryptedManifest,
+		PayloadSize: payloadSize, EncryptedManifest: encryptedManifest, ResumeRooms: resumeRooms,
+		StreamCount: len(ranges), StreamPayloadSizes: streamPayloadSizes(ranges), AttachToken: attachToken,
 	}
 	if len(encryptedManifest) > protocol.MaxFrameSize/2 {
 		return "", fmt.Errorf("encrypted manifest juda katta: %s", HumanBytes(int64(len(encryptedManifest))))
 	}
+
+	// V6 LAN fast-path: sender opens an authenticated local endpoint. The
+	// candidate addresses are encrypted into the transfer code, so the public
+	// relay never learns the sender's LAN addresses.
+	var direct *directSender
+	var routeBlob string
+	if cfg.LANDirect {
+		directSession := cloneSession(session)
+		directSession.StreamCount = 1
+		directSession.StreamPayloadSizes = []int64{payloadSize}
+		directSession.AttachToken = ""
+		if d, derr := startDirectSender(secret, directSession, dataAEAD, plans, manifest.TotalSize); derr == nil {
+			candidates := localRouteCandidates(d.Port())
+			if len(candidates) > 0 {
+				if blob, e := encryptRouteHint(secret, candidates); e == nil {
+					direct = d
+					routeBlob = blob
+				} else {
+					d.Close()
+				}
+			} else {
+				d.Close()
+			}
+		}
+	}
+	if direct != nil {
+		defer direct.Close()
+	}
+	directStarted := false
+	publicSelected := false
 
 	room := ""
 	code := ""
@@ -126,7 +169,14 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 						err = errors.New("unexpected create response")
 					default:
 						room = created.Room
-						code = encodeTransferCode(room, secret)
+						if direct != nil {
+							direct.SetRoom(room)
+							if !directStarted {
+								directStarted = true
+								go direct.Serve()
+							}
+						}
+						code = encodeTransferCode(room, secret, routeBlob)
 						if cfg.OnRoomCreated != nil {
 							cfg.OnRoomCreated(room)
 						}
@@ -137,6 +187,9 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 						fmt.Printf(" TRANSFER CODE:\n %s\n", code)
 						fmt.Printf("==============================================================\n")
 						fmt.Println("[🔒] End-to-end encryption: AES-256-GCM")
+						if direct != nil {
+							fmt.Println("[⚡] V6 LAN direct endpoint tayyor; receiver avval local route'ni sinaydi.")
+						}
 						fmt.Println("[i] To'liq code'ni qabul qiluvchiga bering; SECRET serverga yuborilmaydi.")
 						fmt.Println()
 					}
@@ -145,7 +198,11 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		} else {
 			resumeMeta := session
 			resumeMeta.EncryptedManifest = nil
-			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeResumeSend, Room: room, Session: &resumeMeta})
+			resumeRoom := room
+			if attempt > 0 && attempt-1 < len(resumeRooms) {
+				resumeRoom = resumeRooms[attempt-1]
+			}
+			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeResumeSend, Room: resumeRoom, Session: &resumeMeta})
 			if err == nil {
 				var resumed protocol.Message
 				resumed, err = protocol.ReadMessage(conn)
@@ -174,7 +231,37 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 			return code, err
 		}
 
-		ready, err := protocol.ReadMessage(conn)
+		var ready protocol.Message
+		if direct != nil && !publicSelected {
+			type readyResult struct {
+				msg protocol.Message
+				err error
+			}
+			readyCh := make(chan readyResult, 1)
+			go func(c net.Conn) {
+				m, e := protocol.ReadMessage(c)
+				readyCh <- readyResult{m, e}
+			}(conn)
+			select {
+			case <-direct.selected:
+				fmt.Println("[⚡] LAN direct route tanlandi. Public relay payload uchun ishlatilmaydi.")
+				_ = conn.Close()
+				go cancelPublicRoom(cfg, room, session.AttachToken)
+				directErr := <-direct.done
+				if directErr == nil {
+					return code, nil
+				}
+				return code, directErr
+			case rr := <-readyCh:
+				ready, err = rr.msg, rr.err
+				if err == nil {
+					publicSelected = true
+					direct.Close()
+				}
+			}
+		} else {
+			ready, err = protocol.ReadMessage(conn)
+		}
 		if err != nil {
 			_ = conn.Close()
 			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
@@ -196,18 +283,42 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 			return code, errors.New("unexpected peer-ready response")
 		}
 
-		planIndex, err := chunkIndexForCipherOffset(plans, session.PayloadSize, ready.Offset)
-		if err != nil {
-			_ = conn.Close()
-			return code, err
+		var sendErr error
+		var progress *ProgressWriter
+		if session.StreamCount > 1 {
+			if len(ready.Offsets) != session.StreamCount {
+				_ = conn.Close()
+				return code, errors.New("server stream resume offset count noto'g'ri")
+			}
+			plainBase := int64(0)
+			for i, r := range ranges {
+				done, e := streamPlainDone(plans, r, ready.Offsets[i])
+				if e != nil {
+					_ = conn.Close()
+					return code, e
+				}
+				plainBase += done
+			}
+			if plainBase > 0 {
+				fmt.Printf("[↻] Parallel resume: %s dan davom etadi (%5.2f%%) | %d stream\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize), session.StreamCount)
+			} else {
+				fmt.Printf("[⇶] Public relay: %d parallel TCP stream\n", session.StreamCount)
+			}
+			progress = NewProgressWriter("Yuborish", manifest.TotalSize, plainBase)
+			sendErr = sendPublicStreams(cfg, room, session.AttachToken, dataAEAD, plans, ranges, ready.Offsets, progress)
+		} else {
+			planIndex, e := chunkIndexForCipherOffset(plans, session.PayloadSize, ready.Offset)
+			if e != nil {
+				_ = conn.Close()
+				return code, e
+			}
+			plainBase := plainDoneAtPlanIndex(plans, planIndex, manifest.TotalSize)
+			if ready.Offset > 0 {
+				fmt.Printf("[↻] Resume: %s dan davom etadi (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize))
+			}
+			progress = NewProgressWriter("Yuborish", manifest.TotalSize, plainBase)
+			sendErr = sendEncryptedChunks(conn, dataAEAD, plans, planIndex, progress)
 		}
-		plainBase := plainDoneAtPlanIndex(plans, planIndex, manifest.TotalSize)
-		if ready.Offset > 0 {
-			fmt.Printf("[↻] Resume: %s dan davom etadi (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize))
-		}
-
-		progress := NewProgressWriter("Yuborish", manifest.TotalSize, plainBase)
-		sendErr := sendEncryptedChunks(conn, dataAEAD, plans, planIndex, progress)
 		progress.Finish()
 		if sendErr != nil {
 			done, elapsed, avg := progress.Snapshot()
@@ -243,6 +354,13 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 }
 
 func sendEncryptedChunks(conn net.Conn, aead cipher.AEAD, plans []chunkPlan, start int, progress *ProgressWriter) error {
+	return sendEncryptedChunksRange(conn, aead, plans, start, len(plans), progress)
+}
+
+func sendEncryptedChunksRange(conn net.Conn, aead cipher.AEAD, plans []chunkPlan, start, end int, progress *ProgressWriter) error {
+	if start < 0 || end < start || end > len(plans) {
+		return errors.New("invalid encrypted chunk range")
+	}
 	var currentPath string
 	var f *os.File
 	defer func() {
@@ -254,7 +372,7 @@ func sendEncryptedChunks(conn net.Conn, aead cipher.AEAD, plans []chunkPlan, sta
 	plainBuf := make([]byte, defaultChunkSize)
 	cipherBuf := make([]byte, 0, defaultChunkSize+aead.Overhead())
 
-	for i := start; i < len(plans); i++ {
+	for i := start; i < end; i++ {
 		p := plans[i]
 		if p.LocalPath == "" {
 			return fmt.Errorf("source mapping topilmadi: %s", p.ManifestPath)
@@ -297,7 +415,7 @@ func sendEncryptedChunks(conn net.Conn, aead cipher.AEAD, plans []chunkPlan, sta
 }
 
 func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string, error) {
-	room, secret, err := parseTransferCode(transferCode)
+	room, secret, routes, err := parseTransferCode(transferCode)
 	if err != nil {
 		return nil, err
 	}
@@ -311,42 +429,81 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 	var session *protocol.SessionMeta
 	var manifest Manifest
 	var plans []chunkPlan
+	var ranges []planRange
 	var dataAEAD cipher.AEAD
 	var staging *receiverStaging
 
+	lanMode := false
+	lanAnnounced := false
+
 	for attempt := 0; attempt <= maxResumeAttempts; attempt++ {
-		conn, err := cfg.dial()
-		if err != nil {
-			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
-				printRetry("serverga qayta ulanish", attempt, err)
-				continue
-			}
-			return nil, err
-		}
-		_ = conn.SetDeadline(time.Now().Add(effectiveIOTimeout(cfg)))
+		var conn net.Conn
+		var joined protocol.Message
+		var err error
+		usingDirect := false
 
-		msgType := protocol.TypeJoin
-		if session != nil {
-			msgType = protocol.TypeResumeReceive
-		}
-		if err := protocol.WriteMessage(conn, protocol.Message{Type: msgType, Room: room}); err != nil {
-			_ = conn.Close()
-			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
-				printRetry("receiver reconnect", attempt, err)
-				continue
+		// V6 route selection: encrypted LAN candidates are attempted before the
+		// public relay. Once direct mode is successfully selected, resumes stay
+		// direct to avoid mixing two independent transports.
+		if cfg.LANDirect && len(routes) > 0 && (attempt == 0 || lanMode) {
+			var directAddr string
+			conn, joined, directAddr, err = tryDirectReceiver(cfg, routes, room, secret, session != nil)
+			if err == nil {
+				usingDirect = true
+				lanMode = true
+				if !lanAnnounced {
+					fmt.Printf("[⚡] LAN direct route topildi: %s. Public relay payload uchun ishlatilmaydi.\n", directAddr)
+					lanAnnounced = true
+				}
+			} else if lanMode {
+				if attempt < maxResumeAttempts {
+					printRetry("LAN direct reconnect", attempt, err)
+					continue
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 
-		joined, err := protocol.ReadMessage(conn)
-		if err != nil {
-			_ = conn.Close()
-			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
-				printRetry("join javobida connection uzildi", attempt, err)
-				continue
+		if !usingDirect {
+			conn, err = cfg.dial()
+			if err != nil {
+				if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+					printRetry("serverga qayta ulanish", attempt, err)
+					continue
+				}
+				return nil, err
 			}
-			return nil, err
+			_ = conn.SetDeadline(time.Now().Add(effectiveIOTimeout(cfg)))
+
+			msgType := protocol.TypeJoin
+			joinRoom := room
+			if session != nil {
+				msgType = protocol.TypeResumeReceive
+				resumeRooms := deriveResumeRooms(secret, maxResumeAttempts)
+				if attempt > 0 && attempt-1 < len(resumeRooms) {
+					joinRoom = resumeRooms[attempt-1]
+				}
+			}
+			if err := protocol.WriteMessage(conn, protocol.Message{Type: msgType, Room: joinRoom}); err != nil {
+				_ = conn.Close()
+				if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+					printRetry("receiver reconnect", attempt, err)
+					continue
+				}
+				return nil, err
+			}
+
+			joined, err = protocol.ReadMessage(conn)
+			if err != nil {
+				_ = conn.Close()
+				if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+					printRetry("join javobida connection uzildi", attempt, err)
+					continue
+				}
+				return nil, err
+			}
 		}
+
 		if joined.Type == protocol.TypeComplete {
 			_ = conn.Close()
 			if staging == nil || session == nil {
@@ -365,6 +522,10 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			_ = conn.Close()
 			return nil, errors.New("unexpected join response")
 		}
+		// Routing credentials are derived locally from the E2E secret rather than
+		// trusted from relay metadata.
+		joined.Session.AttachToken = deriveAttachToken(secret)
+		joined.Session.ResumeRooms = nil
 
 		if session == nil {
 			s := *joined.Session
@@ -401,31 +562,56 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 				_ = conn.Close()
 				return nil, errors.New("session payload_size manifest bilan mos emas")
 			}
+			if s.StreamCount < 1 || s.StreamCount > maxParallelStreams {
+				_ = conn.Close()
+				return nil, errors.New("session stream_count noto'g'ri")
+			}
+			ranges = splitPlanRanges(plans, s.StreamCount)
+			if len(ranges) != s.StreamCount || len(s.StreamPayloadSizes) != s.StreamCount {
+				_ = conn.Close()
+				return nil, errors.New("session stream metadata noto'g'ri")
+			}
+			for i := range ranges {
+				if ranges[i].CipherSize != s.StreamPayloadSizes[i] {
+					_ = conn.Close()
+					return nil, errors.New("session stream payload manifest bilan mos emas")
+				}
+			}
 			session = &s
 			files, dirs := manifestCounts(manifest)
 			fmt.Printf("[i] %d ta fayl, %d ta folder | Jami: %s\n", files, dirs, HumanBytes(manifest.TotalSize))
 			fmt.Println("[🔒] End-to-end encryption tasdiqlandi. Manifest decrypt qilindi.")
-		} else if joined.Session.TransferID != session.TransferID || joined.Session.PayloadSize != session.PayloadSize || joined.Session.PlainSize != session.PlainSize {
+		} else if !sameSessionIdentity(*joined.Session, *session) {
 			_ = conn.Close()
 			return nil, errors.New("resume session original transfer bilan mos emas")
 		}
 
-		staging, _, err = openReceiverStaging(outputDir, room, session.TransferID, manifest, plans, session.PayloadSize)
+		staging, _, err = openReceiverStaging(outputDir, room, session.TransferID, manifest, plans, session.PayloadSize, session.StreamPayloadSizes)
 		if err != nil {
 			_ = conn.Close()
 			return nil, err
 		}
-		planIndex, err := chunkIndexForCipherOffset(plans, session.PayloadSize, staging.state.CipherOffset)
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
+		offsets := staging.streamOffsets()
+		plainBase := int64(0)
+		for i, r := range ranges {
+			done, e := streamPlainDone(plans, r, offsets[i])
+			if e != nil {
+				_ = conn.Close()
+				return nil, e
+			}
+			plainBase += done
 		}
-		plainBase := plainDoneAtPlanIndex(plans, planIndex, manifest.TotalSize)
-		if staging.state.CipherOffset > 0 {
+		if plainBase > 0 {
 			fmt.Printf("[↻] Receiver resume: lokal state = %s (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, manifest.TotalSize))
 		}
 
-		if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeReceiverReady, Room: room, Offset: staging.state.CipherOffset}); err != nil {
+		readyMsg := protocol.Message{Type: protocol.TypeReceiverReady, Room: room}
+		if session.StreamCount > 1 && !usingDirect {
+			readyMsg.Offsets = offsets
+		} else {
+			readyMsg.Offset = offsets[0]
+		}
+		if err := protocol.WriteMessage(conn, readyMsg); err != nil {
 			_ = conn.Close()
 			if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
 				printRetry("receiver ready yuborishda connection uzildi", attempt, err)
@@ -454,13 +640,39 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			_ = conn.Close()
 			return nil, errors.New(ready.Text)
 		}
-		if ready.Type != protocol.TypePeerReady || ready.Offset != staging.state.CipherOffset {
+		if ready.Type != protocol.TypePeerReady {
+			_ = conn.Close()
+			return nil, errors.New("server peer-ready noto'g'ri")
+		}
+		if session.StreamCount > 1 && !usingDirect {
+			if len(ready.Offsets) != len(offsets) {
+				_ = conn.Close()
+				return nil, errors.New("server stream resume offset count noto'g'ri")
+			}
+			for i := range offsets {
+				if ready.Offsets[i] != offsets[i] {
+					_ = conn.Close()
+					return nil, errors.New("server stream resume offsetni o'zgartirdi")
+				}
+			}
+		} else if ready.Offset != offsets[0] {
 			_ = conn.Close()
 			return nil, errors.New("server noto'g'ri resume offset qaytardi")
 		}
 
 		progress := NewProgressWriter("Qabul qilish", manifest.TotalSize, plainBase)
-		recvErr := receiveEncryptedChunks(conn, dataAEAD, staging, plans, planIndex, progress)
+		var recvErr error
+		if session.StreamCount > 1 && !usingDirect {
+			fmt.Printf("[⇶] Public relay: %d parallel TCP stream\n", session.StreamCount)
+			recvErr = receivePublicStreams(cfg, room, session.AttachToken, dataAEAD, staging, plans, ranges, offsets, progress)
+		} else {
+			planIndex, e := streamPlanIndexForOffset(plans, ranges[0], offsets[0])
+			if e != nil {
+				_ = conn.Close()
+				return nil, e
+			}
+			recvErr = receiveEncryptedChunks(conn, dataAEAD, staging, plans, planIndex, progress)
+		}
 		progress.Finish()
 		if recvErr != nil {
 			done, elapsed, avg := progress.Snapshot()
@@ -510,8 +722,16 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 }
 
 func receiveEncryptedChunks(conn net.Conn, aead cipher.AEAD, staging *receiverStaging, plans []chunkPlan, start int, progress *ProgressWriter) error {
+	return receiveEncryptedChunksRange(conn, aead, staging, plans, 0, start, len(plans), progress)
+}
+
+func receiveEncryptedChunksRange(conn net.Conn, aead cipher.AEAD, staging *receiverStaging, plans []chunkPlan, streamID, start, end int, progress *ProgressWriter) error {
+	if start < 0 || end < start || end > len(plans) {
+		return errors.New("invalid encrypted chunk range")
+	}
 	maxCipherSize := aead.Overhead()
-	for _, p := range plans {
+	for i := start; i < end; i++ {
+		p := plans[i]
 		if int(p.CipherSize) > maxCipherSize {
 			maxCipherSize = int(p.CipherSize)
 		}
@@ -525,7 +745,8 @@ func receiveEncryptedChunks(conn net.Conn, aead cipher.AEAD, staging *receiverSt
 		}
 	}()
 
-	for i := start; i < len(plans); i++ {
+	streamOffset := staging.streamOffset(streamID)
+	for i := start; i < end; i++ {
 		p := plans[i]
 		ciphertext := cipherBuf[:int(p.CipherSize)]
 		if _, err := io.ReadFull(conn, ciphertext); err != nil {
@@ -564,8 +785,8 @@ func receiveEncryptedChunks(conn net.Conn, aead cipher.AEAD, staging *receiverSt
 		if _, err := f.WriteAt(plaintext, p.FileOffset); err != nil {
 			return err
 		}
-		nextOffset := p.CipherOffset + p.CipherSize
-		if err := staging.commitOffset(nextOffset); err != nil {
+		streamOffset += p.CipherSize
+		if err := staging.commitStreamOffset(streamID, streamOffset); err != nil {
 			return err
 		}
 		progress.Add(int64(p.PlainSize))
@@ -586,6 +807,19 @@ func ReceiveFile(cfg ClientConfig, transferCode, outputDir string) (string, erro
 		return outputDir, nil
 	}
 	return paths[0], nil
+}
+
+func cancelPublicRoom(cfg ClientConfig, room, token string) {
+	conn, err := cfg.dial()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeCancel, Room: room, Token: token}) != nil {
+		return
+	}
+	_, _ = protocol.ReadMessage(conn)
 }
 
 func effectiveIOTimeout(cfg ClientConfig) time.Duration {

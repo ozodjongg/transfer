@@ -97,7 +97,7 @@ func fatalConfig(err error) {
 }
 
 func usage() {
-	fmt.Print(`Pro Transfer v5
+	fmt.Print(`Pro Transfer v6
 
 Yuborish:
   transfer send <file-or-folder> [more files/folders...]
@@ -111,8 +111,14 @@ Joriy sozlama:
 Misollar:
   transfer send report.xlsx
   transfer send report.xlsx photo.jpg "D:\My Project"
-  transfer receive BHTP8AH7XN.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  transfer receive ROOM.SECRET.ENCRYPTED_ROUTES
 
-V5: multiple files/folders + end-to-end AES-256-GCM + resume.
+V6:
+  - multiple files/folders
+  - end-to-end AES-256-GCM
+  - automatic LAN direct fast-path + public relay fallback
+  - parallel public TCP streams
+  - per-stream authenticated resume
+  - secret-derived reconnect aliases
 `)
 }

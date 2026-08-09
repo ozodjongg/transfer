@@ -40,8 +40,8 @@ func TestEncryptedManifestRoundTripAndHidesNames(t *testing.T) {
 
 func TestTransferCodeRoundTrip(t *testing.T) {
 	secret, _ := generateTransferSecret()
-	code := encodeTransferCode("abc123", secret)
-	room, got, err := parseTransferCode(code)
+	code := encodeTransferCode("abc123", secret, "")
+	room, got, _, err := parseTransferCode(code)
 	if err != nil {
 		t.Fatal(err)
 	}

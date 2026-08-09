@@ -26,6 +26,7 @@ func getTransferBuffer() (*[]byte, func()) {
 }
 
 type ProgressWriter struct {
+	mu         sync.Mutex
 	Total      int64
 	Done       int64
 	BaseOffset int64
@@ -52,6 +53,8 @@ func (p *ProgressWriter) Write(b []byte) (int, error) {
 }
 
 func (p *ProgressWriter) Add(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if n <= 0 {
 		return
 	}
@@ -95,6 +98,8 @@ func (p *ProgressWriter) print(now time.Time) {
 }
 
 func (p *ProgressWriter) Finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if !p.printed || p.lastDone != p.Done {
 		p.print(time.Now())
 	}
@@ -104,6 +109,8 @@ func (p *ProgressWriter) Finish() {
 }
 
 func (p *ProgressWriter) Snapshot() (done int64, elapsed time.Duration, avgBytesPerSecond float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	elapsed = time.Since(p.startedAt)
 	done = p.Done
 	transferred := p.Done - p.BaseOffset

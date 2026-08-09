@@ -9,22 +9,48 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type resumeState struct {
-	Version      int    `json:"version"`
-	TransferID   string `json:"transfer_id"`
-	CipherOffset int64  `json:"cipher_offset"`
+	Version       int     `json:"version"`
+	TransferID    string  `json:"transfer_id"`
+	CipherOffsets []int64 `json:"cipher_offsets"`
 }
 
 type receiverStaging struct {
+	mu         sync.Mutex
 	root       string
 	contentDir string
 	statePath  string
 	state      resumeState
 }
 
-func openReceiverStaging(outputDir, room, transferID string, manifest Manifest, plans []chunkPlan, payloadSize int64) (*receiverStaging, int, error) {
+func openReceiverStaging(outputDir, room, transferID string, manifest Manifest, plans []chunkPlan, payloadSize int64, streamSizesOpt ...[]int64) (*receiverStaging, int, error) {
+	streamSizes := []int64{payloadSize}
+	if len(streamSizesOpt) > 0 && len(streamSizesOpt[0]) > 0 {
+		streamSizes = append([]int64(nil), streamSizesOpt[0]...)
+	}
+	var sum int64
+	for _, n := range streamSizes {
+		if n < 0 {
+			return nil, 0, errors.New("negative stream payload size")
+		}
+		sum += n
+	}
+	if sum != payloadSize {
+		return nil, 0, errors.New("stream payload sizes total payload bilan mos emas")
+	}
+	ranges := splitPlanRanges(plans, len(streamSizes))
+	if len(ranges) != len(streamSizes) {
+		return nil, 0, errors.New("stream range count mismatch")
+	}
+	for i := range ranges {
+		if ranges[i].CipherSize != streamSizes[i] {
+			return nil, 0, errors.New("stream payload size manifest chunk plan bilan mos emas")
+		}
+	}
+
 	shortID := transferID
 	if len(shortID) > 12 {
 		shortID = shortID[:12]
@@ -43,7 +69,7 @@ func openReceiverStaging(outputDir, room, transferID string, manifest Manifest, 
 		return nil, 0, err
 	}
 	if !exists {
-		state = resumeState{Version: 1, TransferID: transferID, CipherOffset: 0}
+		state = resumeState{Version: 2, TransferID: transferID, CipherOffsets: make([]int64, len(streamSizes))}
 		if err := clearContentDir(content); err != nil {
 			return nil, 0, err
 		}
@@ -54,22 +80,30 @@ func openReceiverStaging(outputDir, room, transferID string, manifest Manifest, 
 			return nil, 0, err
 		}
 	} else {
-		if state.Version != 1 || state.TransferID != transferID {
-			return nil, 0, errors.New("mavjud resume state boshqa transferga tegishli")
+		if state.Version != 2 || state.TransferID != transferID {
+			return nil, 0, errors.New("mavjud resume state boshqa transfer/protocolga tegishli")
 		}
-		if state.CipherOffset < 0 || state.CipherOffset > payloadSize {
-			return nil, 0, errors.New("resume state offset noto'g'ri")
+		if len(state.CipherOffsets) != len(streamSizes) {
+			return nil, 0, errors.New("resume stream count original transfer bilan mos emas")
+		}
+		for i, off := range state.CipherOffsets {
+			if off < 0 || off > streamSizes[i] {
+				return nil, 0, errors.New("resume stream offset noto'g'ri")
+			}
+			if _, err := streamPlanIndexForOffset(plans, ranges[i], off); err != nil {
+				return nil, 0, fmt.Errorf("resume state buzilgan: %w", err)
+			}
 		}
 	}
-	idx, err := chunkIndexForCipherOffset(plans, payloadSize, state.CipherOffset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("resume state buzilgan: %w", err)
-	}
-	if err := restoreContentToPlanIndex(content, manifest, plans, idx); err != nil {
+	if err := restoreContentToStreamOffsets(content, manifest, plans, ranges, state.CipherOffsets); err != nil {
 		return nil, 0, err
 	}
 	st.state = state
-	return st, idx, nil
+	firstIdx, err := streamPlanIndexForOffset(plans, ranges[0], state.CipherOffsets[0])
+	if err != nil {
+		return nil, 0, err
+	}
+	return st, firstIdx, nil
 }
 
 func loadResumeState(path string) (resumeState, bool, error) {
@@ -132,15 +166,33 @@ func materializeDirectories(content string, manifest Manifest) error {
 // chunk boundary. If the process/network died after writing a chunk but before
 // state.json was committed, the extra bytes are safely truncated.
 func restoreContentToPlanIndex(content string, manifest Manifest, plans []chunkPlan, idx int) error {
+	ranges := []planRange{{Start: 0, End: len(plans)}}
+	var off int64
+	for i := 0; i < idx && i < len(plans); i++ {
+		off += plans[i].CipherSize
+	}
+	return restoreContentToStreamOffsets(content, manifest, plans, ranges, []int64{off})
+}
+
+func restoreContentToStreamOffsets(content string, manifest Manifest, plans []chunkPlan, ranges []planRange, offsets []int64) error {
 	if err := materializeDirectories(content, manifest); err != nil {
 		return err
 	}
+	if len(ranges) != len(offsets) {
+		return errors.New("restore stream count mismatch")
+	}
 	expected := make(map[int]int64)
-	for i := 0; i < idx; i++ {
-		p := plans[i]
-		end := p.FileOffset + int64(p.PlainSize)
-		if end > expected[p.ManifestIndex] {
-			expected[p.ManifestIndex] = end
+	for streamID, r := range ranges {
+		idx, err := streamPlanIndexForOffset(plans, r, offsets[streamID])
+		if err != nil {
+			return err
+		}
+		for i := r.Start; i < idx; i++ {
+			p := plans[i]
+			end := p.FileOffset + int64(p.PlainSize)
+			if end > expected[p.ManifestIndex] {
+				expected[p.ManifestIndex] = end
+			}
 		}
 	}
 	for i, e := range manifest.Entries {
@@ -171,8 +223,35 @@ func restoreContentToPlanIndex(content string, manifest Manifest, plans []chunkP
 }
 
 func (s *receiverStaging) commitOffset(offset int64) error {
-	s.state.CipherOffset = offset
+	return s.commitStreamOffset(0, offset)
+}
+
+func (s *receiverStaging) commitStreamOffset(streamID int, offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if streamID < 0 || streamID >= len(s.state.CipherOffsets) {
+		return errors.New("invalid resume stream id")
+	}
+	if offset < s.state.CipherOffsets[streamID] {
+		return errors.New("resume stream offset orqaga ketishi mumkin emas")
+	}
+	s.state.CipherOffsets[streamID] = offset
 	return saveResumeState(s.statePath, s.state)
+}
+
+func (s *receiverStaging) streamOffsets() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.state.CipherOffsets...)
+}
+
+func (s *receiverStaging) streamOffset(streamID int) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if streamID < 0 || streamID >= len(s.state.CipherOffsets) {
+		return 0
+	}
+	return s.state.CipherOffsets[streamID]
 }
 
 func verifyStaging(content string, manifest Manifest) error {

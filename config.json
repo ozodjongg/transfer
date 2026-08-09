@@ -3,11 +3,14 @@
   "download_dir": "downloads",
   "tls": {
     "enabled": false,
-    "insecure_skip_verify": false,
-    "server_name": ""
+    "insecure_skip_verify": false
   },
   "timeouts": {
     "connect": "10s",
     "io": "2h"
+  },
+  "network": {
+    "lan_direct": true,
+    "parallel_streams": 4
   }
 }

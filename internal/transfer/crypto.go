@@ -16,9 +16,14 @@ import (
 
 const (
 	transferSecretSize = 32
-	manifestAAD        = "pro-transfer/v5/manifest"
-	dataAADPrefix      = "pro-transfer/v5/data"
+	manifestAAD        = "pro-transfer/v6/manifest"
+	dataAADPrefix      = "pro-transfer/v6/data"
 )
+
+func deriveAttachToken(secret []byte) string {
+	key := hkdfSHA256(secret, "public-data-attach-token", 32)
+	return base64.RawURLEncoding.EncodeToString(key)
+}
 
 func generateTransferSecret() ([]byte, error) {
 	secret := make([]byte, transferSecretSize)
@@ -28,29 +33,39 @@ func generateTransferSecret() ([]byte, error) {
 	return secret, nil
 }
 
-func encodeTransferCode(room string, secret []byte) string {
-	return strings.ToUpper(strings.TrimSpace(room)) + "." + base64.RawURLEncoding.EncodeToString(secret)
+func encodeTransferCode(room string, secret []byte, encryptedRouteHint string) string {
+	code := strings.ToUpper(strings.TrimSpace(room)) + "." + base64.RawURLEncoding.EncodeToString(secret)
+	if strings.TrimSpace(encryptedRouteHint) != "" {
+		code += "." + strings.TrimSpace(encryptedRouteHint)
+	}
+	return code
 }
 
-func parseTransferCode(code string) (room string, secret []byte, err error) {
+func parseTransferCode(code string) (room string, secret []byte, routes []string, err error) {
 	code = strings.TrimSpace(code)
 	parts := strings.Split(code, ".")
-	if len(parts) != 2 {
-		return "", nil, errors.New("transfer code noto'g'ri: ROOM.SECRET formatida bo'lishi kerak")
+	if len(parts) != 2 && len(parts) != 3 {
+		return "", nil, nil, errors.New("transfer code noto'g'ri: ROOM.SECRET[.ROUTES] formatida bo'lishi kerak")
 	}
 	room = strings.ToUpper(strings.TrimSpace(parts[0]))
 	if room == "" {
-		return "", nil, errors.New("room code bo'sh")
+		return "", nil, nil, errors.New("room code bo'sh")
 	}
 	secret, err = base64.RawURLEncoding.DecodeString(strings.TrimSpace(parts[1]))
 	if err != nil || len(secret) != transferSecretSize {
-		return "", nil, errors.New("transfer secret noto'g'ri")
+		return "", nil, nil, errors.New("transfer secret noto'g'ri")
 	}
-	return room, secret, nil
+	if len(parts) == 3 {
+		routes, err = decryptRouteHint(secret, parts[2])
+		if err != nil {
+			return "", nil, nil, err
+		}
+	}
+	return room, secret, routes, nil
 }
 
 func hkdfSHA256(secret []byte, info string, n int) []byte {
-	salt := []byte("pro-transfer/v5/hkdf-salt")
+	salt := []byte("pro-transfer/v6/hkdf-salt")
 	extract := hmac.New(sha256.New, salt)
 	_, _ = extract.Write(secret)
 	prk := extract.Sum(nil)
