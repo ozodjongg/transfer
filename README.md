@@ -29,6 +29,23 @@ Example `config.json`:
 }
 ```
 
+For a free working server:
+
+```json
+{
+  "server": "mainline.proxy.rlwy.net:27783",
+  "download_dir": "downloads",
+  "tls": {
+    "enabled": false,
+    "insecure_skip_verify": false
+  },
+  "timeouts": {
+    "connect": "10s",
+    "io": "2h"
+  }
+}
+```
+
 For a local server:
 
 ```json
