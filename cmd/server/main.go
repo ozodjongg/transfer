@@ -25,7 +25,8 @@ func main() {
 	maxRooms := flag.Int("max-rooms", 100, "maximum simultaneous rooms")
 	maxManifestMB := flag.Int("max-manifest-mb", 2, "maximum encrypted manifest size in MiB")
 	maxConnections := flag.Int("max-connections", 240, "maximum simultaneous TCP connections")
-	maxHandshakes := flag.Int("max-handshakes-per-minute", 600, "maximum new handshakes per IP per minute")
+	maxHandshakes := flag.Int("max-handshakes-per-minute", 600, "maximum new TCP handshakes per IP per minute")
+	maxPakeAttempts := flag.Int("max-pake-attempts", 16, "maximum initial PAKE attempts per room")
 	certFile := flag.String("tls-cert", "", "TLS certificate PEM file")
 	keyFile := flag.String("tls-key", "", "TLS private key PEM file")
 	flag.Parse()
@@ -55,6 +56,7 @@ func main() {
 		MaxRooms:               *maxRooms,
 		MaxConnections:         *maxConnections,
 		MaxHandshakesPerMinute: *maxHandshakes,
+		MaxPAKEAttemptsPerRoom: *maxPakeAttempts,
 		TLSConfig:              tlsConfig,
 		Logger:                 logger,
 	})

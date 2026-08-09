@@ -97,7 +97,7 @@ func fatalConfig(err error) {
 }
 
 func usage() {
-	fmt.Print(`Pro Transfer v6
+	fmt.Print(`Pro Transfer v7
 
 Yuborish:
   transfer send <file-or-folder> [more files/folders...]
@@ -111,12 +111,13 @@ Joriy sozlama:
 Misollar:
   transfer send report.xlsx
   transfer send report.xlsx photo.jpg "D:\My Project"
-  transfer receive ROOM.SECRET.ENCRYPTED_ROUTES
+  transfer receive silvercastle-mangostream-orbitrocket-velvettiger
 
-V6:
+V7:
   - multiple files/folders
+  - 4-word PAKE invitation code
   - end-to-end AES-256-GCM
-  - automatic LAN direct fast-path + public relay fallback
+  - encrypted LAN negotiation + automatic LAN direct/public fallback
   - parallel public TCP streams
   - per-stream authenticated resume
   - secret-derived reconnect aliases

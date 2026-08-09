@@ -74,6 +74,14 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 	fileCount, dirCount := manifestCounts(manifest)
 	fmt.Printf("[i] %d ta fayl, %d ta folder | Jami: %s\n", fileCount, dirCount, HumanBytes(manifest.TotalSize))
 
+	phrase, err := generateCodePhrase()
+	if err != nil {
+		return "", err
+	}
+	room, err := roomFromCodePhrase(phrase)
+	if err != nil {
+		return "", err
+	}
 	manifestJSON, err := marshalManifest(manifest)
 	if err != nil {
 		return "", err
@@ -113,11 +121,11 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		return "", fmt.Errorf("encrypted manifest juda katta: %s", HumanBytes(int64(len(encryptedManifest))))
 	}
 
-	// V6 LAN fast-path: sender opens an authenticated local endpoint. The
-	// candidate addresses are encrypted into the transfer code, so the public
-	// relay never learns the sender's LAN addresses.
+	// V7: LAN candidates are NOT embedded in the user-visible code. They are
+	// delivered only after PAKE succeeds, inside the PAKE-authenticated secret
+	// envelope. The public relay therefore sees neither the phrase nor LAN IPs.
 	var direct *directSender
-	var routeBlob string
+	var routes []string
 	if cfg.LANDirect {
 		directSession := cloneSession(session)
 		directSession.StreamCount = 1
@@ -126,12 +134,9 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		if d, derr := startDirectSender(secret, directSession, dataAEAD, plans, manifest.TotalSize); derr == nil {
 			candidates := localRouteCandidates(d.Port())
 			if len(candidates) > 0 {
-				if blob, e := encryptRouteHint(secret, candidates); e == nil {
-					direct = d
-					routeBlob = blob
-				} else {
-					d.Close()
-				}
+				direct = d
+				routes = candidates
+				direct.SetRoom(room)
 			} else {
 				d.Close()
 			}
@@ -142,13 +147,14 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 	}
 	directStarted := false
 	publicSelected := false
+	created := false
+	pakeDone := false
+	code := phrase
 
-	room := ""
-	code := ""
 	for attempt := 0; attempt <= maxResumeAttempts; attempt++ {
 		conn, err := cfg.dial()
 		if err != nil {
-			if room != "" && attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+			if created && attempt < maxResumeAttempts && isRetryableNetworkError(err) {
 				printRetry("serverga qayta ulanish", attempt, err)
 				continue
 			}
@@ -156,27 +162,23 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		}
 		_ = conn.SetDeadline(time.Now().Add(effectiveIOTimeout(cfg)))
 
-		if room == "" {
-			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeCreate, Session: &session})
+		if !created {
+			err = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeCreate, Room: room, Session: &session})
 			if err == nil {
-				var created protocol.Message
-				created, err = protocol.ReadMessage(conn)
+				var createdMsg protocol.Message
+				createdMsg, err = protocol.ReadMessage(conn)
 				if err == nil {
 					switch {
-					case created.Type == protocol.TypeError:
-						err = errors.New(created.Text)
-					case created.Type != protocol.TypeCreated || created.Room == "":
+					case createdMsg.Type == protocol.TypeError:
+						err = errors.New(createdMsg.Text)
+					case createdMsg.Type != protocol.TypeCreated || createdMsg.Room != room:
 						err = errors.New("unexpected create response")
 					default:
-						room = created.Room
-						if direct != nil {
-							direct.SetRoom(room)
-							if !directStarted {
-								directStarted = true
-								go direct.Serve()
-							}
+						created = true
+						if direct != nil && !directStarted {
+							directStarted = true
+							go direct.Serve()
 						}
-						code = encodeTransferCode(room, secret, routeBlob)
 						if cfg.OnRoomCreated != nil {
 							cfg.OnRoomCreated(room)
 						}
@@ -186,11 +188,11 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 						fmt.Printf("\n==============================================================\n")
 						fmt.Printf(" TRANSFER CODE:\n %s\n", code)
 						fmt.Printf("==============================================================\n")
-						fmt.Println("[🔒] End-to-end encryption: AES-256-GCM")
+						fmt.Println("[🔐] 4-word PAKE handshake + AES-256-GCM end-to-end encryption")
 						if direct != nil {
-							fmt.Println("[⚡] V6 LAN direct endpoint tayyor; receiver avval local route'ni sinaydi.")
+							fmt.Println("[⚡] LAN direct endpoint tayyor; route PAKE'dan keyin xavfsiz uzatiladi.")
 						}
-						fmt.Println("[i] To'liq code'ni qabul qiluvchiga bering; SECRET serverga yuborilmaydi.")
+						fmt.Println("[i] Faqat 4-word code'ni qabul qiluvchiga bering; code serverga yuborilmaydi.")
 						fmt.Println()
 					}
 				}
@@ -214,7 +216,7 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 					case protocol.TypeError:
 						err = errors.New(resumed.Text)
 					case protocol.TypeJoined:
-						fmt.Printf("[i] Room %s ga qayta ulandi. Resume kutilmoqda...\n", room)
+						fmt.Printf("[i] Secure room %s ga qayta ulandi. Resume kutilmoqda...\n", room)
 					default:
 						err = errors.New("unexpected resume response")
 					}
@@ -222,10 +224,38 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 			}
 		}
 
+		if err != nil && !created && strings.Contains(err.Error(), "room collision") && attempt < maxResumeAttempts {
+			_ = conn.Close()
+			phrase, err = generateCodePhrase()
+			if err != nil {
+				return code, err
+			}
+			room, err = roomFromCodePhrase(phrase)
+			if err != nil {
+				return code, err
+			}
+			code = phrase
+			if direct != nil {
+				direct.SetRoom(room)
+			}
+			continue
+		}
+
+		if err == nil && !pakeDone {
+			// Receiver initiates PAKE after joining. Only after mutual key
+			// confirmation do we wrap the random 256-bit transfer secret and LAN
+			// candidates for the receiver.
+			err = senderPakeExchange(conn, code, room, session.TransferID, secret, routes)
+			if err == nil {
+				pakeDone = true
+				fmt.Println("[🔐] PAKE tasdiqlandi. Receiver E2E transfer secret'ni xavfsiz oldi.")
+			}
+		}
+
 		if err != nil {
 			_ = conn.Close()
-			if room != "" && attempt < maxResumeAttempts && isRetryableNetworkError(err) {
-				printRetry("sender reconnect", attempt, err)
+			if created && attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+				printRetry("sender secure reconnect", attempt, err)
 				continue
 			}
 			return code, err
@@ -415,7 +445,11 @@ func sendEncryptedChunksRange(conn net.Conn, aead cipher.AEAD, plans []chunkPlan
 }
 
 func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string, error) {
-	room, secret, routes, err := parseTransferCode(transferCode)
+	phrase, err := normalizeCodePhrase(transferCode)
+	if err != nil {
+		return nil, err
+	}
+	room, err := roomFromCodePhrase(phrase)
 	if err != nil {
 		return nil, err
 	}
@@ -426,6 +460,8 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 		return nil, err
 	}
 
+	var secret []byte
+	var routes []string
 	var session *protocol.SessionMeta
 	var manifest Manifest
 	var plans []chunkPlan
@@ -442,20 +478,18 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 		var err error
 		usingDirect := false
 
-		// V6 route selection: encrypted LAN candidates are attempted before the
-		// public relay. Once direct mode is successfully selected, resumes stay
-		// direct to avoid mixing two independent transports.
-		if cfg.LANDirect && len(routes) > 0 && (attempt == 0 || lanMode) {
+		// Once an initial PAKE handshake selected LAN direct, reconnects stay on
+		// LAN so encrypted chunk offsets cannot be mixed across transports.
+		if lanMode && cfg.LANDirect && len(routes) > 0 && len(secret) == transferSecretSize {
 			var directAddr string
 			conn, joined, directAddr, err = tryDirectReceiver(cfg, routes, room, secret, session != nil)
 			if err == nil {
 				usingDirect = true
-				lanMode = true
 				if !lanAnnounced {
 					fmt.Printf("[⚡] LAN direct route topildi: %s. Public relay payload uchun ishlatilmaydi.\n", directAddr)
 					lanAnnounced = true
 				}
-			} else if lanMode {
+			} else {
 				if attempt < maxResumeAttempts {
 					printRetry("LAN direct reconnect", attempt, err)
 					continue
@@ -492,7 +526,6 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 				}
 				return nil, err
 			}
-
 			joined, err = protocol.ReadMessage(conn)
 			if err != nil {
 				_ = conn.Close()
@@ -522,8 +555,48 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			_ = conn.Close()
 			return nil, errors.New("unexpected join response")
 		}
-		// Routing credentials are derived locally from the E2E secret rather than
-		// trusted from relay metadata.
+
+		// Initial public rendezvous performs PAKE before any transfer secret or
+		// LAN route is available to the receiver. The four-word code never goes
+		// to the relay and is never used directly as an AES key.
+		if session == nil && !usingDirect {
+			secret, routes, err = receiverPakeExchange(conn, phrase, room, joined.Session.TransferID)
+			if err != nil {
+				_ = conn.Close()
+				if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
+					printRetry("PAKE handshake", attempt, err)
+					continue
+				}
+				return nil, err
+			}
+			fmt.Println("[🔐] PAKE mutual confirmation muvaffaqiyatli. Random E2E transfer secret olindi.")
+
+			// Now that routes arrived inside the PAKE-authenticated envelope, try
+			// LAN. If it succeeds, switch the active session to the sender's local
+			// single-stream endpoint and close the public control connection.
+			if cfg.LANDirect && len(routes) > 0 {
+				directConn, directJoined, directAddr, derr := tryDirectReceiver(cfg, routes, room, secret, false)
+				if derr == nil {
+					_ = conn.Close()
+					conn = directConn
+					joined = directJoined
+					usingDirect = true
+					lanMode = true
+					if !lanAnnounced {
+						fmt.Printf("[⚡] LAN direct route topildi: %s. Public relay payload uchun ishlatilmaydi.\n", directAddr)
+						lanAnnounced = true
+					}
+				}
+			}
+		}
+
+		if len(secret) != transferSecretSize {
+			_ = conn.Close()
+			return nil, errors.New("E2E transfer secret mavjud emas")
+		}
+
+		// Routing credentials are derived locally from the random transfer secret;
+		// relay metadata is never a trust source for these values.
 		joined.Session.AttachToken = deriveAttachToken(secret)
 		joined.Session.ResumeRooms = nil
 
@@ -536,7 +609,7 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			plainManifest, err := decryptManifest(secret, s.EncryptedManifest)
 			if err != nil {
 				_ = conn.Close()
-				return nil, fmt.Errorf("SECRET noto'g'ri yoki manifest buzilgan: %w", err)
+				return nil, fmt.Errorf("manifest authentication failed: %w", err)
 			}
 			manifest, err = unmarshalManifest(plainManifest)
 			if err != nil {
@@ -580,7 +653,7 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			session = &s
 			files, dirs := manifestCounts(manifest)
 			fmt.Printf("[i] %d ta fayl, %d ta folder | Jami: %s\n", files, dirs, HumanBytes(manifest.TotalSize))
-			fmt.Println("[🔒] End-to-end encryption tasdiqlandi. Manifest decrypt qilindi.")
+			fmt.Println("[🔒] AES-256-GCM manifest decrypt/authentication tasdiqlandi.")
 		} else if !sameSessionIdentity(*joined.Session, *session) {
 			_ = conn.Close()
 			return nil, errors.New("resume session original transfer bilan mos emas")

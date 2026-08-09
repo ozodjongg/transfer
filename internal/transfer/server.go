@@ -1,7 +1,6 @@
 package transfer
 
 import (
-	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -15,8 +14,6 @@ import (
 	"example.com/pro-transfer/internal/protocol"
 )
 
-const roomAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-
 type ServerConfig struct {
 	Addr                   string
 	RoomTTL                time.Duration
@@ -27,6 +24,7 @@ type ServerConfig struct {
 	MaxRooms               int
 	MaxConnections         int
 	MaxHandshakesPerMinute int
+	MaxPAKEAttemptsPerRoom int
 	TLSConfig              *tls.Config
 	Logger                 *slog.Logger
 }
@@ -65,6 +63,8 @@ type room struct {
 	relaying        bool
 	completed       bool
 	verified        bool
+	pakeDone        bool
+	pakeAttempts    int
 
 	senderData   map[int]*peerConn
 	receiverData map[int]*peerConn
@@ -116,6 +116,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	if cfg.MaxHandshakesPerMinute <= 0 {
 		cfg.MaxHandshakesPerMinute = 600
+	}
+	if cfg.MaxPAKEAttemptsPerRoom <= 0 {
+		cfg.MaxPAKEAttemptsPerRoom = 16
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -204,7 +207,7 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	switch msg.Type {
 	case protocol.TypeCreate:
-		s.handleCreate(conn, msg.Session)
+		s.handleCreate(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Session)
 	case protocol.TypeResumeSend:
 		s.handleResumeSend(conn, strings.ToUpper(strings.TrimSpace(msg.Room)), msg.Session)
 	case protocol.TypeJoin:
@@ -222,7 +225,7 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) handleCreate(conn net.Conn, session *protocol.SessionMeta) {
+func (s *Server) handleCreate(conn net.Conn, requestedRoom string, session *protocol.SessionMeta) {
 	if err := s.validateSession(session, true); err != nil {
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: err.Error()})
 		return
@@ -249,24 +252,25 @@ func (s *Server) handleCreate(conn net.Conn, session *protocol.SessionMeta) {
 			return
 		}
 	}
-	for {
-		code, err := secureRoomCode(10)
-		if err != nil {
-			s.mu.Unlock()
-			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room generation failed"})
-			return
-		}
-		if _, exists := s.rooms[code]; !exists {
-			if _, aliasExists := s.aliases[code]; aliasExists {
-				continue
-			}
-			r.code = code
-			s.rooms[code] = r
-			for _, alias := range r.aliases {
-				s.aliases[alias] = r
-			}
-			break
-		}
+	if !validOpaqueRoom(requestedRoom) {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "invalid room selector"})
+		return
+	}
+	if _, exists := s.rooms[requestedRoom]; exists {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room collision; retry transfer"})
+		return
+	}
+	if _, exists := s.aliases[requestedRoom]; exists {
+		s.mu.Unlock()
+		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room collision; retry transfer"})
+		return
+	}
+	r.code = requestedRoom
+	s.rooms[requestedRoom] = r
+	for _, alias := range r.aliases {
+		s.aliases[alias] = r
 	}
 	s.mu.Unlock()
 
@@ -352,6 +356,14 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 		}
 		return
 	}
+	if !resume && !r.pakeDone {
+		if r.pakeAttempts >= s.cfg.MaxPAKEAttemptsPerRoom {
+			s.mu.Unlock()
+			_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "PAKE attempt limit reached for this room"})
+			return
+		}
+		r.pakeAttempts++
+	}
 	if !resume && r.receiver != nil {
 		s.mu.Unlock()
 		_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeError, Text: "room already has a receiver"})
@@ -375,6 +387,13 @@ func (s *Server) handleReceiver(conn net.Conn, code string, resume bool) {
 	if err := protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeJoined, Room: code, Session: &session}); err != nil {
 		p.close()
 		return
+	}
+	if !resume {
+		if err := s.relayInitialPAKE(r, p); err != nil {
+			s.cfg.Logger.Warn("PAKE handshake interrupted", "room", r.code, "error", err)
+			s.recoverInitialHandshake(r, p)
+			return
+		}
 	}
 	ready, err := protocol.ReadMessage(conn)
 	if err != nil {
@@ -1004,16 +1023,82 @@ func (s *Server) Shutdown() error {
 	return nil
 }
 
-func secureRoomCode(n int) (string, error) {
-	if n <= 0 {
-		return "", errors.New("invalid room code length")
+func validOpaqueRoom(room string) bool {
+	if len(room) != 16 {
+		return false
 	}
-	buf, raw := make([]byte, n), make([]byte, n)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
+	for _, c := range room {
+		if !((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7')) {
+			return false
+		}
 	}
-	for i, b := range raw {
-		buf[i] = roomAlphabet[int(b)%len(roomAlphabet)]
+	return true
+}
+
+func (s *Server) relayInitialPAKE(r *room, rp *peerConn) error {
+	s.mu.Lock()
+	if r.completed || r.receiver != rp || r.sender == nil {
+		s.mu.Unlock()
+		return errors.New("room peers unavailable for PAKE")
 	}
-	return string(buf), nil
+	if r.pakeDone {
+		s.mu.Unlock()
+		return nil
+	}
+	sp := r.sender
+	s.mu.Unlock()
+
+	relayOne := func(from, to net.Conn, want string) error {
+		m, err := protocol.ReadMessage(from)
+		if err != nil {
+			return err
+		}
+		if m.Type != want {
+			return fmt.Errorf("%s expected, got %s", want, m.Type)
+		}
+		// Keep the relay blind to the PAKE password and transfer secret. It only
+		// forwards public PAKE values, confirmation tags and ciphertext.
+		return protocol.WriteMessage(to, m)
+	}
+	if err := relayOne(rp.conn, sp.conn, protocol.TypePakeA); err != nil {
+		return err
+	}
+	if err := relayOne(sp.conn, rp.conn, protocol.TypePakeB); err != nil {
+		return err
+	}
+	if err := relayOne(rp.conn, sp.conn, protocol.TypePakeConfirmA); err != nil {
+		return err
+	}
+	if err := relayOne(sp.conn, rp.conn, protocol.TypeSecretWrap); err != nil {
+		return err
+	}
+	if err := relayOne(rp.conn, sp.conn, protocol.TypePakeOK); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if !r.completed && r.receiver == rp && r.sender == sp {
+		r.pakeDone = true
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) recoverInitialHandshake(r *room, rp *peerConn) {
+	s.mu.Lock()
+	if r.receiver == rp {
+		r.receiver = nil
+	}
+	sp := r.sender
+	if sp != nil {
+		r.sender = nil
+	}
+	r.receiverReady = false
+	r.relaying = false
+	r.expiresAt = time.Now().Add(s.cfg.ResumeGrace)
+	s.mu.Unlock()
+	rp.close()
+	if sp != nil {
+		sp.close()
+	}
 }

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version      = 6
+	Version      = 7
 	MaxFrameSize = 4 * 1024 * 1024
 
 	TypeCreate        = "create"
@@ -19,6 +19,12 @@ const (
 	TypeCancel        = "cancel"
 	TypeDataSend      = "data_send"
 	TypeDataReceive   = "data_receive"
+
+	TypePakeA        = "pake_a"
+	TypePakeB        = "pake_b"
+	TypePakeConfirmA = "pake_confirm_a"
+	TypeSecretWrap   = "secret_wrap"
+	TypePakeOK       = "pake_ok"
 
 	TypeCreated       = "created"
 	TypeJoined        = "joined"
@@ -40,6 +46,9 @@ type Message struct {
 	Token   string       `json:"token,omitempty"`
 	Stream  int          `json:"stream,omitempty"`
 	Session *SessionMeta `json:"session,omitempty"`
+	Payload []byte       `json:"payload,omitempty"`
+	Salt    []byte       `json:"salt,omitempty"`
+	Confirm []byte       `json:"confirm,omitempty"`
 }
 
 // SessionMeta intentionally contains no filenames, folder names or plaintext
