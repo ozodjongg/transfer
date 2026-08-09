@@ -149,3 +149,17 @@ go vet ./...
 Control messages are length-prefixed JSON frames (`uint32 big-endian length + JSON`).
 After `file_meta`, exactly `size` raw bytes follow. The receiver calculates SHA-256 and
 only renames the temporary file when the hash and server completion message are valid.
+
+## Windows: PATH avtomatik sozlanadi
+
+`client.exe` Windows'da birinchi marta ishga tushganda o'z papkasini joriy foydalanuvchining **User PATH** qiymatiga avtomatik qo'shadi. Administrator huquqi talab qilinmaydi va System PATH o'zgartirilmaydi.
+
+Birinchi ishga tushirishdan keyin yangi CMD yoki PowerShell oynasini oching. Keyin `client.exe` qayerda turganidan qat'i nazar quyidagicha ishlatish mumkin:
+
+```powershell
+client send C:\Files\report.xlsx
+client receive AB7K4M9Q2X
+client config
+```
+
+Agar PATH'ni avtomatik yangilash Windows siyosati sabab bloklansa, client ishlashda davom etadi va faqat ogohlantirish chiqaradi.

@@ -10,6 +10,16 @@ import (
 )
 
 func main() {
+	// On Windows, make the CLI available from any newly opened terminal without
+	// asking the user to edit PATH manually. This writes only to User PATH, so
+	// administrator privileges are not required.
+	if added, dir, err := ensureExecutableOnUserPath(); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] PATH avtomatik sozlanmadi: %v\n", err)
+	} else if added {
+		fmt.Printf("[i] Client Windows User PATH'iga qo'shildi: %s\n", dir)
+		fmt.Println("[i] 'client' komandasini ishlatish uchun yangi CMD/PowerShell oynasini oching.")
+	}
+
 	// Config is ensured before parsing commands so even the first bare launch
 	// (for example, double-clicking client.exe) creates config.json next to
 	// the executable.

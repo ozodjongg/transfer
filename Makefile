@@ -14,8 +14,8 @@ build:
 
 windows:
 	mkdir -p bin
-	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/server-windows-amd64.exe ./cmd/server
-	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/client-windows-amd64.exe ./cmd/client
+	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/server.exe ./cmd/server
+	GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/client.exe ./cmd/client
 	cp config.json bin/config.json
 
 clean:
