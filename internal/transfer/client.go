@@ -23,15 +23,23 @@ const (
 )
 
 type ClientConfig struct {
-	Addr            string
-	TLSConfig       *tls.Config
-	ConnectTimeout  time.Duration
-	IOTimeout       time.Duration
-	LANDirect       bool
-	ParallelStreams int
+	Addr                string
+	TLSConfig           *tls.Config
+	ConnectTimeout      time.Duration
+	IOTimeout           time.Duration
+	LANDirect           bool
+	InternetP2P         bool
+	STUNServers         []string
+	P2PDiscoveryTimeout time.Duration
+	P2PConnectTimeout   time.Duration
+	ParallelStreams     int
 
 	OnRoomCreated  func(string)
 	OnTransferCode func(string)
+
+	// testP2PFailAfterBytes is used only by package integration tests to force
+	// a hard failure after P2P selection. Production callers leave it zero.
+	testP2PFailAfterBytes int64
 }
 
 func (c ClientConfig) dial() (net.Conn, error) {
@@ -121,30 +129,34 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		return "", fmt.Errorf("encrypted manifest juda katta: %s", HumanBytes(int64(len(encryptedManifest))))
 	}
 
-	// V7: LAN candidates are NOT embedded in the user-visible code. They are
-	// delivered only after PAKE succeeds, inside the PAKE-authenticated secret
-	// envelope. The public relay therefore sees neither the phrase nor LAN IPs.
+	// V8 keeps all direct-route metadata out of the user-visible code. LAN
+	// candidates and the optional public UDP/STUN endpoint are exchanged only
+	// inside the PAKE-authenticated envelope.
 	var direct *directSender
 	var routes []string
-	if cfg.LANDirect {
+	if cfg.LANDirect || cfg.InternetP2P {
 		directSession := cloneSession(session)
 		directSession.StreamCount = 1
 		directSession.StreamPayloadSizes = []int64{payloadSize}
 		directSession.AttachToken = ""
-		if d, derr := startDirectSender(secret, directSession, dataAEAD, plans, manifest.TotalSize); derr == nil {
-			candidates := localRouteCandidates(d.Port())
-			if len(candidates) > 0 {
-				direct = d
-				routes = candidates
-				direct.SetRoom(room)
-			} else {
-				d.Close()
+		if d, derr := startDirectSender(secret, directSession, dataAEAD, plans, manifest.TotalSize, cfg.LANDirect); derr == nil {
+			direct = d
+			direct.SetRoom(room)
+			if cfg.LANDirect {
+				routes = localRouteCandidates(d.Port())
 			}
 		}
 	}
 	if direct != nil {
 		defer direct.Close()
 	}
+	var senderP2P *p2pPeer
+	var p2pPrepared bool
+	defer func() {
+		if senderP2P != nil {
+			_ = senderP2P.Close()
+		}
+	}()
 	directStarted := false
 	publicSelected := false
 	created := false
@@ -175,7 +187,7 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 						err = errors.New("unexpected create response")
 					default:
 						created = true
-						if direct != nil && !directStarted {
+						if direct != nil && cfg.LANDirect && len(routes) > 0 && !directStarted {
 							directStarted = true
 							go direct.Serve()
 						}
@@ -189,8 +201,11 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 						fmt.Printf(" TRANSFER CODE:\n %s\n", code)
 						fmt.Printf("==============================================================\n")
 						fmt.Println("[🔐] 4-word PAKE handshake + AES-256-GCM end-to-end encryption")
-						if direct != nil {
+						if cfg.LANDirect && len(routes) > 0 {
 							fmt.Println("[⚡] LAN direct endpoint tayyor; route PAKE'dan keyin xavfsiz uzatiladi.")
+						}
+						if cfg.InternetP2P {
+							fmt.Println("[🌐] Internet P2P: STUN + authenticated UDP hole-punch sinab ko'riladi; ishlamasa relay fallback.")
 						}
 						fmt.Println("[i] Faqat 4-word code'ni qabul qiluvchiga bering; code serverga yuborilmaydi.")
 						fmt.Println()
@@ -242,13 +257,36 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 		}
 
 		if err == nil && !pakeDone {
-			// Receiver initiates PAKE after joining. Only after mutual key
-			// confirmation do we wrap the random 256-bit transfer secret and LAN
-			// candidates for the receiver.
-			err = senderPakeExchange(conn, code, room, session.TransferID, secret, routes)
+			if cfg.InternetP2P && !p2pPrepared {
+				p2pPrepared = true
+				if peer, perr := prepareP2PPeer(cfg); perr == nil {
+					senderP2P = peer
+				} else {
+					fmt.Printf("[i] Internet P2P candidate olinmadi (%s); relay fallback mavjud.\n", networkErrorSummary(perr))
+				}
+			}
+			p2pEndpoint := ""
+			if senderP2P != nil {
+				p2pEndpoint = senderP2P.Endpoint()
+			}
+			var remoteP2P string
+			remoteP2P, err = senderPakeExchange(conn, code, room, session.TransferID, secret, routes, p2pEndpoint)
 			if err == nil {
 				pakeDone = true
 				fmt.Println("[🔐] PAKE tasdiqlandi. Receiver E2E transfer secret'ni xavfsiz oldi.")
+				if direct != nil && senderP2P != nil && remoteP2P != "" {
+					go func(peer *p2pPeer, endpoint string) {
+						p2pConn, perr := peer.Establish(secret, room, endpoint, effectiveP2PConnectTimeout(cfg))
+						if perr != nil {
+							fmt.Printf("[i] Internet P2P direct ulanmagan (%s); public relay fallback.\n", networkErrorSummary(perr))
+							return
+						}
+						if cfg.testP2PFailAfterBytes > 0 {
+							p2pConn = &failAfterWriteConn{Conn: p2pConn, remaining: cfg.testP2PFailAfterBytes}
+						}
+						direct.ServeP2P(p2pConn)
+					}(senderP2P, remoteP2P)
+				}
 			}
 		}
 
@@ -273,13 +311,30 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 				readyCh <- readyResult{m, e}
 			}(conn)
 			select {
-			case <-direct.selected:
-				fmt.Println("[⚡] LAN direct route tanlandi. Public relay payload uchun ishlatilmaydi.")
+			case kind := <-direct.selected:
+				if kind == "P2P" {
+					fmt.Println("[🌐] Internet P2P direct route tanlandi. Public relay payload uchun ishlatilmaydi.")
+				} else {
+					fmt.Println("[⚡] LAN direct route tanlandi. Public relay payload uchun ishlatilmaydi.")
+				}
 				_ = conn.Close()
-				go cancelPublicRoom(cfg, room, session.AttachToken)
 				directErr := <-direct.done
 				if directErr == nil {
+					go cancelPublicRoom(cfg, room, session.AttachToken)
 					return code, nil
+				}
+				// Keep the rendezvous room on direct failure. Sender's canonical
+				// public multi-stream session is unchanged, so it can reconnect via a
+				// secret-derived resume alias. Receiver restarts its staging from zero
+				// before switching transports to avoid mixing 1-stream direct state
+				// with N-stream relay state.
+				publicSelected = true
+				if senderP2P != nil {
+					_ = senderP2P.Close()
+				}
+				if attempt < maxResumeAttempts {
+					printRetry("direct route uzildi; public relay fallback", attempt, directErr)
+					continue
 				}
 				return code, directErr
 			case rr := <-readyCh:
@@ -287,6 +342,9 @@ func SendPaths(cfg ClientConfig, inputs []string) (string, error) {
 				if err == nil {
 					publicSelected = true
 					direct.Close()
+					if senderP2P != nil {
+						_ = senderP2P.Close()
+					}
 				}
 			}
 		} else {
@@ -468,9 +526,20 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 	var ranges []planRange
 	var dataAEAD cipher.AEAD
 	var staging *receiverStaging
+	var publicSession *protocol.SessionMeta
+	var receiverP2P *p2pPeer
+	var p2pPrepared bool
+	var senderP2PEndpoint string
+	defer func() {
+		if receiverP2P != nil {
+			_ = receiverP2P.Close()
+		}
+	}()
 
 	lanMode := false
 	lanAnnounced := false
+	p2pMode := false
+	p2pAnnounced := false
 
 	for attempt := 0; attempt <= maxResumeAttempts; attempt++ {
 		var conn net.Conn
@@ -555,12 +624,28 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			_ = conn.Close()
 			return nil, errors.New("unexpected join response")
 		}
+		if session == nil && !usingDirect && publicSession == nil {
+			ps := cloneSession(*joined.Session)
+			publicSession = &ps
+		}
 
 		// Initial public rendezvous performs PAKE before any transfer secret or
 		// LAN route is available to the receiver. The four-word code never goes
 		// to the relay and is never used directly as an AES key.
 		if session == nil && !usingDirect {
-			secret, routes, err = receiverPakeExchange(conn, phrase, room, joined.Session.TransferID)
+			if cfg.InternetP2P && !p2pPrepared {
+				p2pPrepared = true
+				if peer, perr := prepareP2PPeer(cfg); perr == nil {
+					receiverP2P = peer
+				} else {
+					fmt.Printf("[i] Internet P2P candidate olinmadi (%s); relay fallback mavjud.\n", networkErrorSummary(perr))
+				}
+			}
+			localP2P := ""
+			if receiverP2P != nil {
+				localP2P = receiverP2P.Endpoint()
+			}
+			secret, routes, senderP2PEndpoint, err = receiverPakeExchange(conn, phrase, room, joined.Session.TransferID, localP2P)
 			if err != nil {
 				_ = conn.Close()
 				if attempt < maxResumeAttempts && isRetryableNetworkError(err) {
@@ -571,9 +656,9 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 			}
 			fmt.Println("[🔐] PAKE mutual confirmation muvaffaqiyatli. Random E2E transfer secret olindi.")
 
-			// Now that routes arrived inside the PAKE-authenticated envelope, try
-			// LAN. If it succeeds, switch the active session to the sender's local
-			// single-stream endpoint and close the public control connection.
+			// Route priority: same-LAN TCP first, then Internet P2P UDP hole-punch,
+			// finally the existing public relay. Direct endpoints were exchanged
+			// only inside the authenticated PAKE envelopes.
 			if cfg.LANDirect && len(routes) > 0 {
 				directConn, directJoined, directAddr, derr := tryDirectReceiver(cfg, routes, room, secret, false)
 				if derr == nil {
@@ -586,6 +671,28 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 						fmt.Printf("[⚡] LAN direct route topildi: %s. Public relay payload uchun ishlatilmaydi.\n", directAddr)
 						lanAnnounced = true
 					}
+				}
+			}
+			if !usingDirect && cfg.InternetP2P && receiverP2P != nil && senderP2PEndpoint != "" {
+				p2pConn, perr := receiverP2P.Establish(secret, room, senderP2PEndpoint, effectiveP2PConnectTimeout(cfg))
+				if perr == nil {
+					p2pJoined, jerr := joinDirectConn(p2pConn, room, secret, false)
+					if jerr == nil {
+						_ = conn.Close()
+						conn = p2pConn
+						joined = p2pJoined
+						usingDirect = true
+						p2pMode = true
+						if !p2pAnnounced {
+							fmt.Printf("[🌐] Internet P2P direct route topildi: %s. Server payloadni relay qilmaydi.\n", senderP2PEndpoint)
+							p2pAnnounced = true
+						}
+					} else {
+						_ = p2pConn.Close()
+						fmt.Printf("[i] Internet P2P direct join ishlamadi (%s); public relay fallback.\n", networkErrorSummary(jerr))
+					}
+				} else {
+					fmt.Printf("[i] Internet P2P ulanmagan (%s); public relay fallback.\n", networkErrorSummary(perr))
 				}
 			}
 		}
@@ -753,6 +860,27 @@ func ReceiveTransfer(cfg ClientConfig, transferCode, outputDir string) ([]string
 				HumanBytes(done), HumanBytes(manifest.TotalSize), HumanDuration(elapsed), HumanBytes(int64(avg)))
 			fmt.Printf("[!] Sabab: %s\n", networkErrorSummary(recvErr))
 			_ = conn.Close()
+			if p2pMode {
+				if publicSession == nil || attempt >= maxResumeAttempts {
+					return nil, fmt.Errorf("Internet P2P session uzildi: %w", recvErr)
+				}
+				if staging != nil {
+					_ = os.RemoveAll(staging.root)
+				}
+				ps := cloneSession(*publicSession)
+				ps.AttachToken = deriveAttachToken(secret)
+				ps.ResumeRooms = nil
+				session = &ps
+				ranges = splitPlanRanges(plans, session.StreamCount)
+				staging = nil
+				p2pMode = false
+				if receiverP2P != nil {
+					_ = receiverP2P.Close()
+				}
+				fmt.Println("[↻] Internet P2P uzildi; public relayga 0 dan xavfsiz fallback qilinmoqda.")
+				printRetry("public relay fallback", attempt, recvErr)
+				continue
+			}
 			if attempt < maxResumeAttempts && isRetryableNetworkError(recvErr) {
 				printRetry("avtomatik resume", attempt, recvErr)
 				continue

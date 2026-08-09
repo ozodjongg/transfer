@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestV7ResumeAliasesAndDirectProofAreSecretDerived(t *testing.T) {
+func TestV8ResumeAliasesAndDirectProofAreSecretDerived(t *testing.T) {
 	secret, _ := generateTransferSecret()
 	other, _ := generateTransferSecret()
 	a := deriveResumeRooms(secret, 8)

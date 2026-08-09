@@ -2,7 +2,7 @@ package transfer
 
 // This file contains a narrowly scoped P-256 password-authenticated key
 // agreement implementation adapted from github.com/schollz/pake/v3 v3.2.0
-// (MIT License). Only the P-256 path needed by Pro Transfer V7 is retained.
+// (MIT License). Only the P-256 path needed by Pro Transfer V8 is retained.
 // See THIRD_PARTY_NOTICES.md.
 
 import (
@@ -23,8 +23,8 @@ const (
 	pakeCurveName        = "p256"
 	pakeSaltSize         = 32
 	pakePurposeTransfer  = "peer-transfer"
-	pakeIdentityDomain   = "pro-transfer/v7/pake/participant/v1"
-	pakeTranscriptDomain = "pro-transfer/v7/pake/channel/v1"
+	pakeIdentityDomain   = "pro-transfer/v8/pake/participant/v1"
+	pakeTranscriptDomain = "pro-transfer/v8/pake/channel/v1"
 )
 
 type pakeWire struct {
@@ -150,7 +150,7 @@ func (p *pakeP256) update(peerBytes []byte) error {
 
 func (p *pakeP256) deriveSessionKey() []byte {
 	h := sha256.New()
-	writePakeField(h, []byte("pro-transfer/v7/pake/identity-bound-session-key/v1"))
+	writePakeField(h, []byte("pro-transfer/v8/pake/identity-bound-session-key/v1"))
 	writePakeField(h, p.password)
 	writePakeField(h, p.idA)
 	writePakeField(h, p.idB)

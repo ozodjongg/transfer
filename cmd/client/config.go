@@ -25,8 +25,12 @@ type AppConfig struct {
 }
 
 type NetworkConfig struct {
-	LANDirect       bool `json:"lan_direct"`
-	ParallelStreams int  `json:"parallel_streams"`
+	LANDirect           bool     `json:"lan_direct"`
+	InternetP2P         bool     `json:"internet_p2p"`
+	STUNServers         []string `json:"stun_servers"`
+	P2PDiscoveryTimeout string   `json:"p2p_discovery_timeout"`
+	P2PConnectTimeout   string   `json:"p2p_connect_timeout"`
+	ParallelStreams     int      `json:"parallel_streams"`
 }
 
 type TLSConfig struct {
@@ -51,7 +55,11 @@ func defaultAppConfig() AppConfig {
 			Connect: "10s",
 			IO:      "2h",
 		},
-		Network: NetworkConfig{LANDirect: true, ParallelStreams: 4},
+		Network: NetworkConfig{
+			LANDirect: true, InternetP2P: true, ParallelStreams: 4,
+			STUNServers:         []string{"stun.l.google.com:19302"},
+			P2PDiscoveryTimeout: "1500ms", P2PConnectTimeout: "5s",
+		},
 	}
 }
 
@@ -141,6 +149,11 @@ func loadAppConfig(path string) (AppConfig, error) {
 	cfg.TLS.ServerName = strings.TrimSpace(cfg.TLS.ServerName)
 	cfg.Timeouts.Connect = strings.TrimSpace(cfg.Timeouts.Connect)
 	cfg.Timeouts.IO = strings.TrimSpace(cfg.Timeouts.IO)
+	for i := range cfg.Network.STUNServers {
+		cfg.Network.STUNServers[i] = strings.TrimSpace(cfg.Network.STUNServers[i])
+	}
+	cfg.Network.P2PDiscoveryTimeout = strings.TrimSpace(cfg.Network.P2PDiscoveryTimeout)
+	cfg.Network.P2PConnectTimeout = strings.TrimSpace(cfg.Network.P2PConnectTimeout)
 	if err := cfg.validate(); err != nil {
 		return AppConfig{}, err
 	}
@@ -169,6 +182,25 @@ func (c AppConfig) validate() error {
 	}
 	if c.Network.ParallelStreams < 1 || c.Network.ParallelStreams > 8 {
 		return errors.New("config: network.parallel_streams 1..8 oralig'ida bo'lishi kerak")
+	}
+	if c.Network.InternetP2P {
+		if len(c.Network.STUNServers) == 0 {
+			return errors.New("config: network.internet_p2p=true bo'lsa kamida bitta stun_servers kerak")
+		}
+		for _, server := range c.Network.STUNServers {
+			if strings.TrimSpace(server) == "" {
+				return errors.New("config: stun_servers ichida bo'sh qiymat bor")
+			}
+			if _, _, err := net.SplitHostPort(server); err != nil {
+				return fmt.Errorf("config: STUN server host:port bo'lishi kerak (%q): %w", server, err)
+			}
+		}
+		if _, err := parseDuration("network.p2p_discovery_timeout", c.Network.P2PDiscoveryTimeout); err != nil {
+			return err
+		}
+		if _, err := parseDuration("network.p2p_connect_timeout", c.Network.P2PConnectTimeout); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -211,12 +243,30 @@ func (c AppConfig) transferConfig() (transfer.ClientConfig, error) {
 		}
 	}
 
+	p2pDiscovery := 1500 * time.Millisecond
+	p2pConnect := 5 * time.Second
+	if c.Network.InternetP2P {
+		var err error
+		p2pDiscovery, err = parseDuration("network.p2p_discovery_timeout", c.Network.P2PDiscoveryTimeout)
+		if err != nil {
+			return transfer.ClientConfig{}, err
+		}
+		p2pConnect, err = parseDuration("network.p2p_connect_timeout", c.Network.P2PConnectTimeout)
+		if err != nil {
+			return transfer.ClientConfig{}, err
+		}
+	}
+
 	return transfer.ClientConfig{
-		Addr:            c.Server,
-		TLSConfig:       tlsConfig,
-		ConnectTimeout:  connectTimeout,
-		IOTimeout:       ioTimeout,
-		LANDirect:       c.Network.LANDirect,
-		ParallelStreams: c.Network.ParallelStreams,
+		Addr:                c.Server,
+		TLSConfig:           tlsConfig,
+		ConnectTimeout:      connectTimeout,
+		IOTimeout:           ioTimeout,
+		LANDirect:           c.Network.LANDirect,
+		InternetP2P:         c.Network.InternetP2P,
+		STUNServers:         append([]string(nil), c.Network.STUNServers...),
+		P2PDiscoveryTimeout: p2pDiscovery,
+		P2PConnectTimeout:   p2pConnect,
+		ParallelStreams:     c.Network.ParallelStreams,
 	}, nil
 }

@@ -219,7 +219,7 @@ func (p *dropOnceProxy) handle(client net.Conn) {
 	<-done
 }
 
-func TestV7ParallelPublicTransferWithDataStreamResume(t *testing.T) {
+func TestV8ParallelPublicTransferWithDataStreamResume(t *testing.T) {
 	serverAddr := freeTCPAddr(t)
 	server := NewServer(ServerConfig{
 		Addr: serverAddr, RoomTTL: 10 * time.Second, TransferTimeout: 30 * time.Second,
@@ -306,7 +306,7 @@ func TestV7ParallelPublicTransferWithDataStreamResume(t *testing.T) {
 	}
 }
 
-func TestV7LANDirectBypassesPublicPayload(t *testing.T) {
+func TestV8LANDirectBypassesPublicPayload(t *testing.T) {
 	serverAddr := freeTCPAddr(t)
 	server := NewServer(ServerConfig{
 		Addr: serverAddr, RoomTTL: 10 * time.Second, TransferTimeout: 30 * time.Second,

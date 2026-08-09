@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	Version      = 7
+	Version      = 8
 	MaxFrameSize = 4 * 1024 * 1024
 
 	TypeCreate        = "create"

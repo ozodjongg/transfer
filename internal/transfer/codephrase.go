@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// V7 uses four human-readable tokens. Each token is selected from a generated
+// V8 uses four human-readable tokens. Each token is selected from a generated
 // 4096-entry compound-word dictionary (64 prefixes × 64 suffixes), giving
 // 12 bits per token / 48 bits total. A small routing slice selects the public
 // rendezvous room; the remaining uncertainty is authenticated by PAKE. The
@@ -120,7 +120,7 @@ func roomFromCodePhrase(code string) (string, error) {
 	selector := (first << 8) | (second >> 4)
 	raw := []byte{byte(selector >> 16), byte(selector >> 8), byte(selector)}
 	h := sha256.New()
-	_, _ = h.Write([]byte("pro-transfer/v7/room"))
+	_, _ = h.Write([]byte("pro-transfer/v8/room"))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(raw)
 	sum := h.Sum(nil)

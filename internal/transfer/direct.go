@@ -22,21 +22,25 @@ type directSender struct {
 	plans   []chunkPlan
 	total   int64
 
-	selected  chan struct{}
+	selected  chan string
 	done      chan error
 	onceSel   sync.Once
 	onceDone  sync.Once
 	closeOnce sync.Once
 }
 
-func startDirectSender(secret []byte, session protocol.SessionMeta, aead cipher.AEAD, plans []chunkPlan, total int64) (*directSender, error) {
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return nil, err
+func startDirectSender(secret []byte, session protocol.SessionMeta, aead cipher.AEAD, plans []chunkPlan, total int64, listenLAN bool) (*directSender, error) {
+	var ln net.Listener
+	var err error
+	if listenLAN {
+		ln, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return nil, err
+		}
 	}
 	d := &directSender{
 		ln: ln, secret: append([]byte(nil), secret...), session: cloneSession(session), aead: aead,
-		plans: plans, total: total, selected: make(chan struct{}), done: make(chan error, 1),
+		plans: plans, total: total, selected: make(chan string, 1), done: make(chan error, 1),
 	}
 	return d, nil
 }
@@ -57,7 +61,11 @@ func (d *directSender) Close() {
 	if d == nil {
 		return
 	}
-	d.closeOnce.Do(func() { _ = d.ln.Close() })
+	d.closeOnce.Do(func() {
+		if d.ln != nil {
+			_ = d.ln.Close()
+		}
+	})
 }
 
 func (d *directSender) finish(err error) {
@@ -69,6 +77,9 @@ func (d *directSender) finish(err error) {
 }
 
 func (d *directSender) Serve() {
+	if d == nil || d.ln == nil {
+		return
+	}
 	for {
 		conn, err := d.ln.Accept()
 		if err != nil {
@@ -80,7 +91,7 @@ func (d *directSender) Serve() {
 			return
 		}
 		configureAcceptedConn(conn)
-		completed, err := d.handleConn(conn)
+		completed, err := d.handleConn(conn, "LAN")
 		_ = conn.Close()
 		if completed {
 			d.finish(nil)
@@ -94,7 +105,7 @@ func (d *directSender) Serve() {
 	}
 }
 
-func (d *directSender) handleConn(conn net.Conn) (bool, error) {
+func (d *directSender) handleConn(conn net.Conn, transport string) (bool, error) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	hello, err := protocol.ReadMessage(conn)
 	if err != nil {
@@ -109,7 +120,7 @@ func (d *directSender) handleConn(conn net.Conn) (bool, error) {
 		return false, errors.New("direct authentication failed")
 	}
 
-	d.onceSel.Do(func() { close(d.selected) })
+	d.onceSel.Do(func() { d.selected <- transport })
 	_ = conn.SetDeadline(time.Time{})
 	session := cloneSession(d.session)
 	// Resume aliases are only meaningful to the public relay and need not be
@@ -138,14 +149,18 @@ func (d *directSender) handleConn(conn net.Conn) (bool, error) {
 	}
 
 	plainBase := plainDoneAtPlanIndex(d.plans, planIndex, d.total)
-	if ready.Offset > 0 {
-		fmt.Printf("[↻] LAN resume: %s dan davom etadi (%5.2f%%)\n", HumanBytes(plainBase), percentage(plainBase, d.total))
+	label := transport
+	if label == "" {
+		label = "DIRECT"
 	}
-	progress := NewProgressWriter("Yuborish [LAN]", d.total, plainBase)
+	if ready.Offset > 0 {
+		fmt.Printf("[↻] %s resume: %s dan davom etadi (%5.2f%%)\n", label, HumanBytes(plainBase), percentage(plainBase, d.total))
+	}
+	progress := NewProgressWriter("Yuborish ["+label+"]", d.total, plainBase)
 	err = sendEncryptedChunks(conn, d.aead, d.plans, planIndex, progress)
 	progress.Finish()
 	if err != nil {
-		fmt.Printf("[!] LAN session uzildi: %s\n", networkErrorSummary(err))
+		fmt.Printf("[!] %s session uzildi: %s\n", label, networkErrorSummary(err))
 		return false, err
 	}
 
@@ -164,6 +179,48 @@ func (d *directSender) handleConn(conn net.Conn) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func (d *directSender) ServeP2P(conn net.Conn) {
+	if d == nil || conn == nil {
+		return
+	}
+	completed, err := d.handleConn(conn, "P2P")
+	_ = conn.Close()
+	if completed {
+		d.finish(nil)
+		return
+	}
+	if err != nil {
+		d.finish(err)
+	}
+}
+
+func joinDirectConn(conn net.Conn, room string, secret []byte, resume bool) (protocol.Message, error) {
+	if conn == nil {
+		return protocol.Message{}, errors.New("direct connection nil")
+	}
+	msgType := protocol.TypeJoin
+	if resume {
+		msgType = protocol.TypeResumeReceive
+	}
+	proof := directProof(secret, room)
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := protocol.WriteMessage(conn, protocol.Message{Type: msgType, Room: room, Proof: proof}); err != nil {
+		return protocol.Message{}, err
+	}
+	joined, err := protocol.ReadMessage(conn)
+	if err != nil {
+		return protocol.Message{}, err
+	}
+	if joined.Type != protocol.TypeJoined || joined.Session == nil {
+		if joined.Type == protocol.TypeError {
+			return protocol.Message{}, errors.New(joined.Text)
+		}
+		return protocol.Message{}, errors.New("unexpected direct join response")
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return joined, nil
 }
 
 func (c ClientConfig) dialAddr(addr string, timeout time.Duration) (net.Conn, error) {
@@ -196,11 +253,6 @@ func tryDirectReceiver(cfg ClientConfig, routes []string, room string, secret []
 	if cfg.ConnectTimeout > 0 && cfg.ConnectTimeout < timeout {
 		timeout = cfg.ConnectTimeout
 	}
-	msgType := protocol.TypeJoin
-	if resume {
-		msgType = protocol.TypeResumeReceive
-	}
-	proof := directProof(secret, room)
 	var lastErr error
 	for _, addr := range routes {
 		conn, err := cfg.dialAddr(addr, timeout)
@@ -208,28 +260,12 @@ func tryDirectReceiver(cfg ClientConfig, routes []string, room string, secret []
 			lastErr = err
 			continue
 		}
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		if err := protocol.WriteMessage(conn, protocol.Message{Type: msgType, Room: room, Proof: proof}); err != nil {
-			lastErr = err
-			_ = conn.Close()
-			continue
-		}
-		joined, err := protocol.ReadMessage(conn)
+		joined, err := joinDirectConn(conn, room, secret, resume)
 		if err != nil {
 			lastErr = err
 			_ = conn.Close()
 			continue
 		}
-		if joined.Type != protocol.TypeJoined || joined.Session == nil {
-			if joined.Type == protocol.TypeError {
-				lastErr = errors.New(joined.Text)
-			} else {
-				lastErr = errors.New("unexpected direct join response")
-			}
-			_ = conn.Close()
-			continue
-		}
-		_ = conn.SetDeadline(time.Time{})
 		return conn, joined, addr, nil
 	}
 	if lastErr == nil {

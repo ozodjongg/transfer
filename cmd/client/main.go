@@ -97,7 +97,7 @@ func fatalConfig(err error) {
 }
 
 func usage() {
-	fmt.Print(`Pro Transfer v7
+	fmt.Print(`Pro Transfer v8
 
 Yuborish:
   transfer send <file-or-folder> [more files/folders...]
@@ -113,11 +113,13 @@ Misollar:
   transfer send report.xlsx photo.jpg "D:\My Project"
   transfer receive silvercastle-mangostream-orbitrocket-velvettiger
 
-V7:
+V8:
   - multiple files/folders
   - 4-word PAKE invitation code
   - end-to-end AES-256-GCM
-  - encrypted LAN negotiation + automatic LAN direct/public fallback
+  - route priority: LAN direct -> Internet P2P -> public relay
+  - STUN + authenticated UDP hole punching for Internet P2P
+  - encrypted LAN/P2P endpoint negotiation after PAKE
   - parallel public TCP streams
   - per-stream authenticated resume
   - secret-derived reconnect aliases

@@ -68,19 +68,22 @@ func TestFourWordCodeAndOpaqueRoom(t *testing.T) {
 func TestPAKESecretWrap(t *testing.T) {
 	key, _ := generateTransferSecret()
 	secret, _ := generateTransferSecret()
-	blob, err := wrapTransferSecret(key, "ABCDEFGH23456789", strings.Repeat("a", 64), secret, []string{"192.168.1.7:41234"})
+	blob, err := wrapTransferSecret(key, "ABCDEFGH23456789", strings.Repeat("a", 64), secret, []string{"192.168.1.7:41234"}, "203.0.113.7:50000")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := unwrapTransferSecret(key, "ABCDEFGH23456789", strings.Repeat("a", 64), blob)
+	got, _, endpoint, err := unwrapTransferSecret(key, "ABCDEFGH23456789", strings.Repeat("a", 64), blob)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, secret) {
 		t.Fatal("secret wrap mismatch")
 	}
+	if endpoint != "203.0.113.7:50000" {
+		t.Fatalf("p2p endpoint=%q", endpoint)
+	}
 	wrong, _ := generateTransferSecret()
-	if _, _, err := unwrapTransferSecret(wrong, "ABCDEFGH23456789", strings.Repeat("a", 64), blob); err == nil {
+	if _, _, _, err := unwrapTransferSecret(wrong, "ABCDEFGH23456789", strings.Repeat("a", 64), blob); err == nil {
 		t.Fatal("wrong PAKE key opened envelope")
 	}
 }
@@ -116,5 +119,29 @@ func TestFourWordRoomDoesNotVerifyFullPAKESecret(t *testing.T) {
 	}
 	if roomC == roomA {
 		t.Fatal("routing selector variation unexpectedly kept the same room")
+	}
+}
+
+func TestP2PAnswerWrap(t *testing.T) {
+	key, _ := generateTransferSecret()
+	room := "ABCDEFGH23456789"
+	transferID := strings.Repeat("b", 64)
+	blob, err := wrapP2PAnswer(key, room, transferID, "198.51.100.25:45678")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(blob, []byte("198.51.100.25")) {
+		t.Fatal("P2P endpoint leaked in PAKE answer ciphertext")
+	}
+	got, err := unwrapP2PAnswer(key, room, transferID, blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "198.51.100.25:45678" {
+		t.Fatalf("endpoint=%q", got)
+	}
+	wrong, _ := generateTransferSecret()
+	if _, err := unwrapP2PAnswer(wrong, room, transferID, blob); err == nil {
+		t.Fatal("wrong PAKE key opened P2P answer")
 	}
 }

@@ -507,7 +507,7 @@ func (s *Server) handleCancel(conn net.Conn, code, token string) {
 	}
 	s.mu.Unlock()
 	_ = protocol.WriteMessage(conn, protocol.Message{Type: protocol.TypeComplete, Room: r.code})
-	s.finishRoom(r, "sender selected LAN direct transport")
+	s.finishRoom(r, "sender selected direct transport")
 }
 
 func (s *Server) handleData(conn net.Conn, code string, stream int, token string, sender bool) {
