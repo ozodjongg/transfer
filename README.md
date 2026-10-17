@@ -219,6 +219,12 @@ docker run --rm -p 8080:8080 pro-transfer-v8
 
 For Railway, expose target TCP port `8080` through a TCP Proxy. Client STUN/P2P traffic does not need to pass through the Railway container.
 
+Step-by-step Railway deployment and automatic GitHub Releases: see [`docs/RAILWAY.md`](docs/RAILWAY.md).
+
+## Releases
+
+Pushing a `v*` tag (for example `git tag v8.0.0 && git push origin v8.0.0`) runs `.github/workflows/release.yml`, which tests, cross-builds Windows/Linux/macOS (amd64 + arm64) archives and publishes them with `SHA256SUMS.txt` on the GitHub Releases page. Set the repository variable `TRANSFER_SERVER` to bake your relay address into the released `config.json`.
+
 ## Build
 
 ```bash

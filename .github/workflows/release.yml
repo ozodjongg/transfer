@@ -1,0 +1,101 @@
+name: Release
+
+# "v*" tag push qilinganda: testlar ishga tushadi, barcha platformalar uchun
+# build qilinadi va natija GitHub Releases sahifasiga yuklanadi.
+# Actions sahifasidan qo'lda ishga tushirilsa (workflow_dispatch) faqat build
+# qilinadi va fayllar workflow artifact sifatida saqlanadi (release yaratilmaydi).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0"
+      # Settings -> Secrets and variables -> Actions -> Variables bo'limida
+      # TRANSFER_SERVER (masalan: xxx.proxy.rlwy.net:12345) qo'yilsa, release
+      # ichidagi config.json shu relay manziliga sozlangan holda chiqadi.
+      TRANSFER_SERVER: ${{ vars.TRANSFER_SERVER }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          name="pro-transfer-${GITHUB_REF_NAME//\//-}-${GOOS}-${GOARCH}"
+          out="dist/$name"
+          mkdir -p "$out"
+          go build -trimpath -ldflags="-s -w" -o "$out/transfer$ext" ./cmd/client
+          go build -trimpath -ldflags="-s -w" -o "$out/server$ext" ./cmd/server
+
+          if [ -n "${TRANSFER_SERVER:-}" ]; then
+            jq --arg s "$TRANSFER_SERVER" '.server = $s' config.json > "$out/config.json"
+          else
+            cp config.json "$out/config.json"
+          fi
+          cp README.md THIRD_PARTY_NOTICES.md "$out/"
+
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip -qr "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
